@@ -14,10 +14,8 @@ services:
       - STATE_FILE=/state/calendar-sync.json
     volumes:
       - ${CALENDAR_SYNC_SA_KEY:-${HOME}/.config/uvi/cal-service-account.json}:/secrets/sa.json:ro
-      - calendar-sync-state:/state
+      - ${CALENDAR_SYNC_STATE_DIR:-${HOME}/.local/state/uvi-calendar-sync}:/state
     networks: [vexa]
-volumes:
-  calendar-sync-state:
 networks:
   vexa:
     external: true

@@ -14,6 +14,10 @@ auto-join on, so Vexa's scheduler sends the bot ~60 s before it starts.
 One Vexa meeting per Meet link (Vexa's own rule): a recurring series tracks its next occurrence.
 State (which plans this job owns) lives in STATE_FILE so it never touches meetings it didn't create.
 
+For each planned meeting it also writes META_DIR/<meet-code>.json — title, start/end, attendee emails
+and the meeting language — for the after-meeting job (Slack mentions, transcription language). The
+language comes from a tag in the event title or description: [EN] English, [HE] Hebrew (default).
+
 Env:
   CALENDAR_ID                 the calendar to read, e.g. bot@example.com (also the impersonated user)
   GOOGLE_SA_KEY_FILE          service-account JSON key (domain-wide delegation)
@@ -24,6 +28,7 @@ Env:
   LOOKAHEAD_DAYS              default 7
   STATE_FILE                  default /state/calendar-sync.json
   END_GRACE_MIN               stop a still-running bot this long after the event ends (default 5)
+  META_DIR                    default /state/meetings
 """
 from __future__ import annotations
 
@@ -53,6 +58,26 @@ STATE_FILE = os.environ.get("STATE_FILE", "/state/calendar-sync.json")
 END_GRACE = timedelta(minutes=float(os.environ.get("END_GRACE_MIN", "5")))
 LIVE = {"requested", "joining", "awaiting_admission", "needs_help", "active"}
 ENDS: dict[str, datetime] = {}  # Meet code → calendar end of the occurrence the bot is for
+META_DIR = os.environ.get("META_DIR", "/state/meetings")
+LANG_RE = re.compile(r"(?:\[|\b(?:lang(?:uage)?\s*[:=]\s*))(en|he)\]?", re.IGNORECASE)
+
+
+def meeting_language(*texts: str) -> str | None:
+    for t in texts:
+        m = LANG_RE.search(t or "")
+        if m:
+            return m.group(1).lower()
+    return None
+
+
+def write_meta(code: str, ev: dict) -> None:
+    os.makedirs(META_DIR, exist_ok=True)
+    path = os.path.join(META_DIR, f"{code}.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"title": ev["title"], "start": iso(ev["start"]), "end": iso(ev["end"]) if ev["end"] else None,
+                   "attendees": ev["attendees"], "language": ev["language"]}, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
 
 _creds = service_account.Credentials.from_service_account_file(
     os.environ["GOOGLE_SA_KEY_FILE"], scopes=SCOPES, subject=CALENDAR_ID
@@ -131,7 +156,14 @@ def wanted_events() -> dict[str, dict]:
             if end and end < now:
                 continue
             if code not in out:  # ordered by start → first seen is the next occurrence
-                out[code] = {"start": start, "end": end, "title": ev.get("summary") or "Meeting"}
+                attendees = [a["email"].lower() for a in ev.get("attendees", [])
+                             if a.get("email") and not a.get("resource") and a.get("email", "").lower() != CALENDAR_ID.lower()
+                             and a.get("responseStatus") != "declined"]
+                org = (ev.get("organizer") or {}).get("email")
+                if org and org.lower() not in attendees and org.lower() != CALENDAR_ID.lower():
+                    attendees.insert(0, org.lower())
+                out[code] = {"start": start, "end": end, "title": ev.get("summary") or "Meeting", "attendees": attendees,
+                             "language": meeting_language(ev.get("summary", ""), ev.get("description", ""))}
         page = body.get("nextPageToken")
         if not page:
             return out
@@ -158,6 +190,10 @@ def sync_once(state: dict[str, int]) -> None:
     for code, ev in wanted.items():
         if ev["end"]:
             ENDS[code] = ev["end"]
+        try:
+            write_meta(code, ev)
+        except OSError as e:
+            log.warning("could not write meeting meta for %s: %s", code, e)
         cur = existing.get(code)
         if cur and cur.get("status") not in PLANNED and cur.get("status") not in {"completed", "failed"}:
             continue  # a bot is live on this link right now

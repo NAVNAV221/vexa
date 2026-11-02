@@ -22,4 +22,10 @@ docker logs -f vexa-calendar-sync-calendar-sync-1
 ```
 
 The plans are created under the user that owns `VEXA_API_KEY`, so they appear in that user's
-Meetings view.
+Meetings view. It also writes `<state>/meetings/<meet-code>.json` (title, times, attendee emails,
+language) for the after-meeting job; state lives in a host directory
+(`~/.local/state/uvi-calendar-sync`, writable by the container's uid 10001).
+
+**Language tag:** `[EN]` (or `lang: en`) in the event title or description marks an English meeting;
+`[HE]`/none = Hebrew. Vexa's own calendar page will say "No calendar connected" — this job plans the
+meetings through the API instead of an ICS feed, which is expected.

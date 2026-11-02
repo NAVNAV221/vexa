@@ -28,12 +28,20 @@ Env:
   VEXA_PG_CONTAINER    default vexa-v012-postgres-1   (final transcript replaces the live one)
   VEXA_REDIS_CONTAINER default vexa-v012-redis-1
   BACKUP_DIR           default ~/.local/state/uvi-meeting-finalizer-backups (live transcript kept here)
+  META_DIR             default ~/.local/state/uvi-calendar-sync/meetings (calendar-sync's per-meeting title,
+                       attendees, language)
+  ROSTER_FILE          default ~/.config/uvi/team_roster.json ({email: {displayName, slackId}})
+  DEFAULT_LANGUAGE     default he — a meeting is English when its title (or invite) carries [EN]
+
+Slack post: one short message — title, date, length, participants as @mentions, a link to the meeting —
+with summary.md and transcript.md attached (Hebrew right-to-left text reads badly inline in Slack).
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -62,20 +70,43 @@ POLL_S = float(os.environ.get("POLL_S", "60"))
 PG = os.environ.get("VEXA_PG_CONTAINER", "vexa-v012-postgres-1")
 REDIS = os.environ.get("VEXA_REDIS_CONTAINER", "vexa-v012-redis-1")
 BACKUP_DIR = os.path.expanduser(os.environ.get("BACKUP_DIR", "~/.local/state/uvi-meeting-finalizer-backups"))
+META_DIR = os.path.expanduser(os.environ.get("META_DIR", "~/.local/state/uvi-calendar-sync/meetings"))
+ROSTER_FILE = os.path.expanduser(os.environ.get("ROSTER_FILE", "~/.config/uvi/team_roster.json"))
+DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "he")
+LANG_RE = re.compile(r"(?:\[|\b(?:lang(?:uage)?\s*[:=]\s*))(en|he)\]?", re.IGNORECASE)
+BOT_EMAILS = {e.strip().lower() for e in os.environ.get("BOT_EMAILS", "shraga@uvi.io").split(",") if e.strip()}
 
-SUMMARY_PROMPT = """You are writing the meeting summary for an Israeli startup's internal Slack channel.
-The text on stdin is an automatic Hebrew transcript of a recorded meeting (it has transcription errors;
-infer the intended meaning, never invent facts that aren't there). Speaker labels come from Google Meet;
-in-room participants may share one label.
+SUMMARY_PROMPT = {
+    "he": """You are writing the summary of an internal meeting at an Israeli startup (Uvi, formerly Naboo).
+The text on stdin is an automatic Hebrew transcript (it has transcription errors; infer the intended
+meaning, never invent facts that aren't there). Speaker labels come from Google Meet; people in one room
+may share one label.
 
-Write the summary in Hebrew, in Slack mrkdwn (*bold*, bullet lines starting with "• "), with these sections,
-omitting any that would be empty:
-*תקציר* — 2–4 sentences.
-*החלטות*
-*משימות* — "• <מי>: <מה>" (owner if stated, otherwise "לא הוגדר").
-*שאלות פתוחות*
-Keep product/tech names in their usual English spelling (e.g. Uvi, Naboo, Shraga, graf, CSA, SQLite).
-Output only the summary, no preamble. If the transcript is too short or garbled to summarize, say so in one line."""
+Output GitHub Markdown, in Hebrew. The FIRST line is exactly `TITLE: <a 3–8 word title for the meeting>`.
+Then these sections, omitting any that would be empty:
+## תקציר — 2–4 sentences.
+## החלטות — bullets.
+## משימות — bullets "- **<מי>:** <מה>" (owner if stated, otherwise "לא הוגדר").
+## שאלות פתוחות — bullets.
+Keep product/tech names in their usual English spelling (Uvi, Naboo, Shraga, graf, CSA, SQLite, …).
+No preamble. If the transcript is too short or garbled to summarize, write `TITLE:` and one line saying so.""",
+    "en": """You are writing the summary of an internal meeting at a startup (Uvi, formerly Naboo).
+The text on stdin is an automatic English transcript (it has transcription errors; infer the intended
+meaning, never invent facts that aren't there). Speaker labels come from Google Meet; people in one room
+may share one label.
+
+Output GitHub Markdown, in English. The FIRST line is exactly `TITLE: <a 3–8 word title for the meeting>`.
+Then these sections, omitting any that would be empty:
+## Summary — 2–4 sentences.
+## Decisions — bullets.
+## Action items — bullets "- **<who>:** <what>" (owner if stated, otherwise "unassigned").
+## Open questions — bullets.
+No preamble. If the transcript is too short or garbled to summarize, write `TITLE:` and one line saying so.""",
+}
+LABELS = {
+    "he": {"participants": "Participants", "open": "Open in Vexa", "min": "min", "transcript": "Transcript"},
+    "en": {"participants": "Participants", "open": "Open in Vexa", "min": "min", "transcript": "Transcript"},
+}
 
 _model = None
 
@@ -159,7 +190,7 @@ def words_to_segments(words: list[dict], off: float) -> list[tuple[float, float,
     return out
 
 
-def api_segments(src: str, workdir: str) -> list[tuple[float, float, str]]:
+def api_segments(src: str, workdir: str, language: str) -> list[tuple[float, float, str]]:
     """Full recording → (start, end, text) via the transcription API, in CHUNK_S mono MP3 pieces
     (MAI-Transcribe 2 rejects Opus re-encoded from the recording's WebM; MP3 is accepted)."""
     with open(STT_KEY_FILE) as f:
@@ -172,7 +203,7 @@ def api_segments(src: str, workdir: str) -> list[tuple[float, float, str]]:
         for attempt in range(5):
             with open(os.path.join(workdir, name), "rb") as f:
                 r = requests.post(STT_URL, headers={"Authorization": f"Bearer {key}"}, timeout=600,
-                                  data={"model": STT_MODEL, "language": "he", "response_format": "verbose_json",
+                                  data={"model": STT_MODEL, "language": language, "response_format": "verbose_json",
                                         "timestamp_granularities[]": "word"},
                                   files={"file": (name, f, "audio/mpeg")})
             if r.status_code in (429, 500, 502, 503, 504) and attempt < 4:
@@ -193,13 +224,13 @@ def api_segments(src: str, workdir: str) -> list[tuple[float, float, str]]:
     return out
 
 
-def local_segments(src: str, workdir: str) -> list[tuple[float, float, str]]:
+def local_segments(src: str, workdir: str, language: str) -> list[tuple[float, float, str]]:
     audio = to_wav(src, os.path.join(workdir, "audio.wav"))
-    segs, _ = whisper().transcribe(audio, language="he", vad_filter=True, beam_size=5, condition_on_previous_text=False)
+    segs, _ = whisper().transcribe(audio, language=language, vad_filter=True, beam_size=5, condition_on_previous_text=False)
     return [(s.start, s.end, s.text) for s in segs]
 
 
-def transcribe(meeting: dict, rec: dict, workdir: str) -> tuple[list[dict], str]:
+def transcribe(meeting: dict, rec: dict, workdir: str, language: str) -> tuple[list[dict], str, list[dict]]:
     src = os.path.join(workdir, "audio.webm")
     with requests.get(f"{VEXA}/recordings/{rec['id']}/media/{rec['media']}/download", headers=VH, stream=True, timeout=120) as r:
         r.raise_for_status()
@@ -210,12 +241,12 @@ def transcribe(meeting: dict, rec: dict, workdir: str) -> tuple[list[dict], str]
     segs = None
     if STT_MODEL and STT_KEY_FILE:
         try:
-            segs = api_segments(src, workdir)
+            segs = api_segments(src, workdir, language)
         except Exception as e:
             log.warning("meeting %s: %s failed (%s) — falling back to %s", meeting["id"], STT_MODEL, e, MODEL)
     if segs is None:
         engine = MODEL
-        segs = local_segments(src, workdir)
+        segs = local_segments(src, workdir, language)
 
     live = vexa(f"/transcripts/google_meet/{meeting['native_meeting_id']}").json().get("segments", [])
     rec_start = (parse(rec.get("created_at")) or parse(meeting.get("start_time"))).timestamp()
@@ -232,19 +263,116 @@ def transcribe(meeting: dict, rec: dict, workdir: str) -> tuple[list[dict], str]
             out.append({"speaker": spk, "start": start, "end": end, "text": text})
     for line in out:
         line["abs_start"], line["abs_end"] = rec_start + line["start"], rec_start + line["end"]
-    return out, engine
+    return out, engine, live
 
 
 def as_text(lines: list[dict]) -> str:
     return "\n".join(f"[{int(l['start'] // 60):02d}:{int(l['start'] % 60):02d}] {l['speaker']}: {l['text']}" for l in lines)
 
 
-def summarize(transcript: str) -> str:
-    r = subprocess.run([CLAUDE, "-p", SUMMARY_PROMPT, "--output-format", "text"], input=transcript,
+def summarize(transcript: str, language: str) -> tuple[str, str]:
+    """→ (title Claude proposes, Markdown body)."""
+    prompt = SUMMARY_PROMPT.get(language, SUMMARY_PROMPT["en"])
+    r = subprocess.run([CLAUDE, "-p", prompt, "--output-format", "text"], input=transcript,
                        capture_output=True, text=True, timeout=600)
     if r.returncode != 0 or not r.stdout.strip():
         raise RuntimeError(f"claude failed ({r.returncode}): {r.stderr.strip()[:300]}")
-    return r.stdout.strip()
+    text = r.stdout.strip()
+    first, _, rest = text.partition("\n")
+    if first.startswith("TITLE:"):
+        return first[len("TITLE:"):].strip(), rest.strip()
+    return "", text
+
+
+# --- meeting context: language, title, participants -------------------------------------------
+
+def meeting_meta(code: str) -> dict:
+    try:
+        with open(os.path.join(META_DIR, f"{code}.json")) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def meeting_language(title: str, meta: dict) -> str:
+    m = LANG_RE.search(title or "")
+    if m:
+        return m.group(1).lower()
+    return (meta.get("language") or DEFAULT_LANGUAGE).lower()
+
+
+def clean_title(title: str) -> str:
+    return re.sub(r"\s{2,}", " ", LANG_RE.sub("", title or "")).strip(" -·|")
+
+
+_roster: dict | None = None
+_slack_users: list[dict] | None = None
+
+
+def roster() -> dict:
+    global _roster
+    if _roster is None:
+        try:
+            with open(ROSTER_FILE) as f:
+                _roster = {k.lower(): v for k, v in json.load(f).items()}
+        except (FileNotFoundError, ValueError):
+            _roster = {}
+    return _roster
+
+
+def slack_get(method: str, **params) -> dict:
+    return requests.get(f"https://slack.com/api/{method}", headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
+                        params=params, timeout=30).json()
+
+
+def slack_id_for_email(email: str) -> str | None:
+    hit = roster().get(email.lower())
+    if hit and hit.get("slackId"):
+        return hit["slackId"]
+    d = slack_get("users.lookupByEmail", email=email)
+    return (d.get("user") or {}).get("id") if d.get("ok") else None
+
+
+def slack_id_for_name(name: str) -> str | None:
+    global _slack_users
+    key = name.strip().lower()
+    for v in roster().values():
+        if v.get("displayName", "").strip().lower() == key and v.get("slackId"):
+            return v["slackId"]
+    if _slack_users is None:
+        _slack_users, cursor = [], ""
+        while True:
+            d = slack_get("users.list", limit=200, cursor=cursor)
+            if not d.get("ok"):
+                break
+            _slack_users += [u for u in d.get("members", []) if not u.get("deleted") and not u.get("is_bot")]
+            cursor = (d.get("response_metadata") or {}).get("next_cursor") or ""
+            if not cursor:
+                break
+    for u in _slack_users:
+        names = {u.get("real_name", ""), (u.get("profile") or {}).get("real_name", ""), (u.get("profile") or {}).get("display_name", "")}
+        if key in {n.strip().lower() for n in names if n}:
+            return u["id"]
+    return None
+
+
+def participants(meta: dict, live: list[dict]) -> list[str]:
+    """Slack mentions for the invitees + whoever spoke (by Meet name); unknown names stay plain text."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for email in meta.get("attendees") or []:
+        if email.lower() in BOT_EMAILS:
+            continue
+        sid = slack_id_for_email(email)
+        tag = f"<@{sid}>" if sid else email
+        if tag not in seen:
+            seen.add(tag); out.append(tag)
+    for name in sorted({s.get("speaker") for s in live if s.get("speaker")}):
+        sid = slack_id_for_name(name)
+        tag = f"<@{sid}>" if sid else name
+        if tag not in seen:
+            seen.add(tag); out.append(tag)
+    return out
 
 
 def slack(method: str, **payload) -> dict:
@@ -267,7 +395,7 @@ def q(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def replace_vexa_transcript(meeting_id: int, lines: list[dict]) -> None:
+def replace_vexa_transcript(meeting_id: int, lines: list[dict], language: str = "he") -> None:
     """Swap the meeting's live segments for the final ones (live rows backed up to BACKUP_DIR first)."""
     mid = int(meeting_id)
     os.makedirs(BACKUP_DIR, exist_ok=True)
@@ -277,60 +405,72 @@ def replace_vexa_transcript(meeting_id: int, lines: list[dict]) -> None:
         with open(backup_path, "w") as f:
             f.write(backup)
     values = ",\n".join(
-        f"({mid}, {l['abs_start']:.3f}, {l['abs_end']:.3f}, {q(l['text'])}, {q(l['speaker']) if l['speaker'] != '?' else 'NULL'}, 'he', 'final-{i:05d}', now())"
+        f"({mid}, {l['abs_start']:.3f}, {l['abs_end']:.3f}, {q(l['text'])}, {q(l['speaker']) if l['speaker'] != '?' else 'NULL'}, {q(language)}, 'final-{i:05d}', now())"
         for i, l in enumerate(lines))
     psql(f"BEGIN;\nDELETE FROM transcriptions WHERE meeting_id = {mid};\n"
          f"INSERT INTO transcriptions (meeting_id, start_time, end_time, text, speaker, language, segment_id, created_at) VALUES\n{values};\nCOMMIT;\n")
     subprocess.run(["docker", "exec", REDIS, "redis-cli", "DEL", f"meeting:{mid}:segments"], capture_output=True, timeout=30)
 
 
-def post(meeting: dict, title: str, summary: str, transcript: str, minutes: int, engine: str) -> None:
-    speakers = sorted({l.split("] ", 1)[1].split(":", 1)[0] for l in transcript.splitlines() if "] " in l} - {"?"})
+def upload_files(files: list[tuple[str, str, str]], comment: str) -> None:
+    """files = [(filename, title, text)] → one Slack message carrying them, with `comment` as its text."""
+    ids = []
+    for filename, title, text in files:
+        data = text.encode("utf-8")
+        up = slack_get("files.getUploadURLExternal", filename=filename, length=len(data))
+        if not up.get("ok"):
+            raise RuntimeError(f"slack files.getUploadURLExternal: {up.get('error')}")
+        requests.post(up["upload_url"], data=data, timeout=60).raise_for_status()
+        ids.append({"id": up["file_id"], "title": title})
+    slack("files.completeUploadExternal", files=ids, channel_id=SLACK_CHANNEL, initial_comment=comment)
+
+
+def post(meeting: dict, title: str, summary_md: str, lines: list[dict], minutes: int, engine: str,
+         who: list[str], language: str) -> None:
+    lab = LABELS.get(language, LABELS["en"])
     started = parse(meeting.get("start_time"))
     when = started.astimezone().strftime("%d/%m/%Y %H:%M") if started else ""
-    link = f"<{UI}/meetings/{meeting['id']}|פתיחה ב-Vexa>" if UI else ""
-    header = f":memo: *{title}* · {when} · {minutes} דק׳" + (f" · {', '.join(speakers)}" if speakers else "")
-    body = f"{header}\n\n{summary}\n\n{link}".strip()
-    # verbatim: Slack must not auto-link bare domains in Hebrew text ("מ-Naboo.ai" → a broken link)
-    chunks, cur = [], ""
-    for para in body.split("\n\n"):
-        if len(cur) + len(para) > 2800 and cur:
-            chunks.append(cur); cur = ""
-        cur = f"{cur}\n\n{para}" if cur else para
-    chunks.append(cur)
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": c[:3000], "verbatim": True}} for c in chunks]
-    msg = slack("chat.postMessage", channel=SLACK_CHANNEL, text=header, blocks=blocks, unfurl_links=False, unfurl_media=False)
-    data = transcript.encode("utf-8")
-    up = requests.get("https://slack.com/api/files.getUploadURLExternal", headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
-                      params={"filename": "transcript.txt", "length": len(data)}, timeout=30).json()
-    if not up.get("ok"):
-        raise RuntimeError(f"slack files.getUploadURLExternal: {up.get('error')}")
-    requests.post(up["upload_url"], data=data, timeout=60).raise_for_status()
-    slack("files.completeUploadExternal", files=[{"id": up["file_id"], "title": f"תמלול — {title}"}],
-          channel_id=SLACK_CHANNEL, thread_ts=msg["ts"], initial_comment=f"התמלול המלא מההקלטה ({engine.split('/')[-1]})")
+    head = f":memo: *{title}* · {when} · {minutes} {lab['min']}"
+    parts = [head]
+    if who:
+        parts.append(f"{lab['participants']}: {' '.join(who)}")
+    if UI:
+        parts.append(f"<{UI}/meetings/{meeting['id']}|{lab['open']}>")
+    comment = "\n".join(parts)
+    plain_who = ", ".join(sorted({l["speaker"] for l in lines if l["speaker"] != "?"}))
+    meta_line = f"{when} · {minutes} {lab['min']}" + (f" · {plain_who}" if plain_who else "")
+    summary_doc = f"# {title}\n\n{meta_line}\n\n{summary_md}\n"
+    transcript_doc = f"# {lab['transcript']} — {title}\n\n{meta_line} · {engine.split('/')[-1]}\n\n" + "\n\n".join(
+        f"**{(f'[{int(l['start'] // 60):02d}:{int(l['start'] % 60):02d}] ' + (l['speaker'] if l['speaker'] != '?' else '')).strip()}** {l['text']}"
+        for l in lines) + "\n"
+    stamp = (started or datetime.now(timezone.utc)).astimezone().strftime("%Y-%m-%d")
+    upload_files([(f"summary-{stamp}.md", f"Summary — {title}", summary_doc),
+                  (f"transcript-{stamp}.md", f"Transcript — {title}", transcript_doc)], comment)
 
 
 def process(meeting: dict, entry: dict) -> str:
     rec = recording_for(meeting["id"])
     if not rec:
         return "waiting-for-recording"
-    title = (meeting.get("data") or {}).get("title") or meeting.get("title") or meeting["native_meeting_id"]
+    meta = meeting_meta(meeting["native_meeting_id"])
+    raw_title = (meeting.get("data") or {}).get("title") or meeting.get("title") or meta.get("title") or ""
+    language = meeting_language(raw_title, meta)
     with tempfile.TemporaryDirectory() as wd:
         t = time.time()
-        lines, engine = transcribe(meeting, rec, wd)
-        log.info("meeting %s: transcribed %d lines in %.0fs with %s", meeting["id"], len(lines), time.time() - t, engine)
+        lines, engine, live = transcribe(meeting, rec, wd, language)
+        log.info("meeting %s: transcribed %d lines in %.0fs with %s (%s)", meeting["id"], len(lines), time.time() - t, engine, language)
     if not lines:
         return "empty"
     if not entry.get("written"):
-        replace_vexa_transcript(meeting["id"], lines)
+        replace_vexa_transcript(meeting["id"], lines, language)
         entry["written"] = True
         log.info("meeting %s: final transcript written to Vexa", meeting["id"])
     if entry.get("status") == "posted":
         return "posted"
-    transcript = as_text(lines)
-    summary = summarize(transcript)
+    proposed, summary = summarize(as_text(lines), language)
+    title = clean_title(raw_title) or proposed or meeting["native_meeting_id"]
     minutes = max(1, round(lines[-1]["end"] / 60))
-    post(meeting, title, summary, transcript, minutes, engine)
+    post(meeting, title, summary, lines, minutes, engine, participants(meta, live), language)
     log.info("meeting %s: posted to Slack", meeting["id"])
     return "posted"
 
