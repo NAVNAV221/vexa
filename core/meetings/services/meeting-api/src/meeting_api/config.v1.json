@@ -584,7 +584,7 @@
    "class": "defaulted",
    "default": "300",
    "description": "calendar-sync sweep cadence (s) — how often connected ICS feeds are re-fetched and upserted into planned meetings",
-   "targets": []
+   "targets": ["compose"]
   },
   {
    "key": "PIPELINE_TICK_STALE_S",
