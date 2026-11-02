@@ -135,7 +135,7 @@ def wanted_events() -> dict[str, dict]:
 
 def vexa_meetings() -> dict[str, dict]:
     """Meet code → newest Vexa meeting record for that link (any status)."""
-    r = requests.get(f"{VEXA}/meetings", headers=VEXA_HEADERS, params={"limit": 200}, timeout=20)
+    r = requests.get(f"{VEXA}/meetings", headers=VEXA_HEADERS, params={"limit": 100}, timeout=20)
     r.raise_for_status()
     by_code: dict[str, dict] = {}
     for m in r.json().get("meetings", []):
