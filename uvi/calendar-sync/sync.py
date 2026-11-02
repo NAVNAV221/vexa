@@ -16,7 +16,8 @@ State (which plans this job owns) lives in STATE_FILE so it never touches meetin
 
 Env:
   CALENDAR_ID                 the calendar to read, e.g. bot@example.com (also the impersonated user)
-  GOOGLE_SA_KEY_FILE          service-account JSON key (domain-wide delegation, calendar.readonly)
+  GOOGLE_SA_KEY_FILE          service-account JSON key (domain-wide delegation)
+  GOOGLE_CALENDAR_SCOPE       default .../auth/calendar.readonly — set to the scope the grant authorizes
   VEXA_API_BASE               e.g. http://gateway:8000
   VEXA_API_KEY                Vexa user token the plans are created under
   SYNC_INTERVAL_S             default 60
@@ -37,7 +38,8 @@ from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 
 log = logging.getLogger("calendar-sync")
-SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+# Must be a scope the domain-wide delegation grant authorizes; the job only ever reads.
+SCOPES = [os.environ.get("GOOGLE_CALENDAR_SCOPE", "https://www.googleapis.com/auth/calendar.readonly")]
 MEET_RE = re.compile(r"https://meet\.google\.com/([a-z]{3}-[a-z]{4}-[a-z]{3})")
 PLANNED = {"idle", "scheduled"}
 
