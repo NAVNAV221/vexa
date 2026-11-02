@@ -81,10 +81,11 @@ export const googleJoinRefusedIndicators: string[] = [
 export const googleConsentPromptIndicators: string[] = [
   // Unquoted text= is substring + case-insensitive, so one entry covers
   // "take notes for me" / "Take notes for me".
-  'text=take notes for me',
+  // Dialog-scoped only: an account with Gemini sees a "Use Gemini to take notes" offer card
+  // and button in the lobby and call — an offer, not a consent gate — so bare text/button
+  // matches would hold a signed-in, already-admitted bot in "joining" for the whole call.
   '[role="dialog"]:has-text("take notes for me")',
   '[role="alertdialog"]:has-text("take notes for me")',
-  'button:has-text("take notes for me")',
   // "taking notes" is dialog-scoped ON PURPOSE: a bare substring would also
   // match the persistent "Gemini is taking notes" in-call pill shown when
   // notes are ALREADY running — that state must not read as a pending consent

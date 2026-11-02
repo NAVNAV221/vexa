@@ -751,7 +751,7 @@ async def request_bot(
         token=token,
         native_meeting_id=native_meeting_id,
         connection_id=connection_id,
-        language=language,
+        language=language or (os.getenv("DEFAULT_BOT_LANGUAGE") or None),
         task=task,
         transcription_tier=transcription_tier,
         redis_url=redis_url,
