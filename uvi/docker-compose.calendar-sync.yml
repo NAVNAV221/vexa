@@ -1,0 +1,24 @@
+# Calendar → Vexa planned meetings via a domain-wide-delegation service account (see calendar-sync/sync.py).
+# Runs beside the main stack on its network:
+#   docker compose -p vexa-calendar-sync -f uvi/docker-compose.calendar-sync.yml up -d --build
+# Secrets stay outside the repo: the SA key file and an env file with CALENDAR_ID + VEXA_API_KEY.
+services:
+  calendar-sync:
+    build: ./calendar-sync
+    image: uvi/vexa-calendar-sync:latest
+    restart: unless-stopped
+    env_file: ${CALENDAR_SYNC_ENV_FILE:-${HOME}/.config/uvi/calendar-sync.env}
+    environment:
+      - GOOGLE_SA_KEY_FILE=/secrets/sa.json
+      - VEXA_API_BASE=http://gateway:8000
+      - STATE_FILE=/state/calendar-sync.json
+    volumes:
+      - ${CALENDAR_SYNC_SA_KEY:-${HOME}/.config/uvi/cal-service-account.json}:/secrets/sa.json:ro
+      - calendar-sync-state:/state
+    networks: [vexa]
+volumes:
+  calendar-sync-state:
+networks:
+  vexa:
+    external: true
+    name: vexa-v012_vexa
