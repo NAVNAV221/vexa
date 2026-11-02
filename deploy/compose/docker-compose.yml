@@ -963,6 +963,11 @@ services:
       - MICROSOFT_CLIENT_SECRET=${MICROSOFT_CLIENT_SECRET:-}
       # Microsoft tenant: "common" = work/school + personal accounts; or a specific tenant id for org-only.
       - MICROSOFT_TENANT_ID=${MICROSOFT_TENANT_ID:-common}
+      # Cloudflare Access sign-in: when the terminal is published behind an Access application, set the
+      # team domain (myteam.cloudflareaccess.com) and the app's AUD tag; a verified Access identity then
+      # signs in directly (no second login). Empty → off.
+      - CF_ACCESS_TEAM_DOMAIN=${CF_ACCESS_TEAM_DOMAIN:-}
+      - CF_ACCESS_AUD=${CF_ACCESS_AUD:-}
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
       interval: 10s
