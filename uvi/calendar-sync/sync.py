@@ -23,6 +23,7 @@ Env:
   SYNC_INTERVAL_S             default 60
   LOOKAHEAD_DAYS              default 7
   STATE_FILE                  default /state/calendar-sync.json
+  END_GRACE_MIN               stop a still-running bot this long after the event ends (default 5)
 """
 from __future__ import annotations
 
@@ -49,6 +50,9 @@ VEXA_HEADERS = {"X-API-Key": os.environ["VEXA_API_KEY"], "Content-Type": "applic
 INTERVAL = float(os.environ.get("SYNC_INTERVAL_S", "60"))
 LOOKAHEAD = timedelta(days=float(os.environ.get("LOOKAHEAD_DAYS", "7")))
 STATE_FILE = os.environ.get("STATE_FILE", "/state/calendar-sync.json")
+END_GRACE = timedelta(minutes=float(os.environ.get("END_GRACE_MIN", "5")))
+LIVE = {"requested", "joining", "awaiting_admission", "needs_help", "active"}
+ENDS: dict[str, datetime] = {}  # Meet code → calendar end of the occurrence the bot is for
 
 _creds = service_account.Credentials.from_service_account_file(
     os.environ["GOOGLE_SA_KEY_FILE"], scopes=SCOPES, subject=CALENDAR_ID
@@ -127,7 +131,7 @@ def wanted_events() -> dict[str, dict]:
             if end and end < now:
                 continue
             if code not in out:  # ordered by start → first seen is the next occurrence
-                out[code] = {"start": start, "title": ev.get("summary") or "Meeting"}
+                out[code] = {"start": start, "end": end, "title": ev.get("summary") or "Meeting"}
         page = body.get("nextPageToken")
         if not page:
             return out
@@ -152,6 +156,8 @@ def sync_once(state: dict[str, int]) -> None:
     existing = vexa_meetings()
 
     for code, ev in wanted.items():
+        if ev["end"]:
+            ENDS[code] = ev["end"]
         cur = existing.get(code)
         if cur and cur.get("status") not in PLANNED and cur.get("status") not in {"completed", "failed"}:
             continue  # a bot is live on this link right now
@@ -187,6 +193,16 @@ def sync_once(state: dict[str, int]) -> None:
             log.info("unplanned %s (event gone; %s)", code, r.status_code)
         if not cur or cur["id"] != mid or cur.get("status") in PLANNED | {"completed", "failed"}:
             state.pop(code, None)
+
+    # Meet gives the bot no reliable "alone" signal, so end it with the calendar event.
+    now = datetime.now(timezone.utc)
+    for code, end in list(ENDS.items()):
+        cur = existing.get(code)
+        if now > end + END_GRACE and cur and cur.get("status") in LIVE:
+            r = requests.delete(f"{VEXA}/bots/google_meet/{code}", headers=VEXA_HEADERS, timeout=20)
+            log.info("stopped bot in %s: event ended %s (%s)", code, iso(end), r.status_code)
+        if now > end + timedelta(hours=2) or (cur and cur.get("status") in {"completed", "failed"} and now > end):
+            ENDS.pop(code, None)
 
 
 def main() -> None:

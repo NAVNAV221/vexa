@@ -1,0 +1,241 @@
+"""After-meeting pass: full-recording Hebrew transcript (ivrit.ai) → Claude summary → Slack.
+
+Vexa's live transcript is built from short per-speaker windows, which is weak for Hebrew. Once a
+meeting completes, this job re-transcribes the whole recording with an ivrit.ai Whisper model
+(faster-whisper, CPU), attributes speakers from Vexa's live segments by time overlap, asks the
+`claude` CLI (the host's Claude Code login) for a Hebrew summary, and posts it to a Slack channel
+with the full transcript attached in the thread.
+
+Polls Vexa every POLL_S seconds; each completed meeting is processed once (STATE_FILE).
+
+Env:
+  VEXA_API_BASE        e.g. http://127.0.0.1:18056
+  VEXA_API_KEY         token of the user who owns the meetings
+  VEXA_UI_URL          e.g. https://meetings.example.com (link in the Slack post)
+  SLACK_BOT_TOKEN      bot token with chat:write + files:write
+  SLACK_CHANNEL        channel id
+  WHISPER_MODEL        default ivrit-ai/whisper-large-v3-turbo-ct2
+  WHISPER_THREADS      default 2 (leave room for live bots)
+  CLAUDE_BIN           default claude
+  PROCESS_SINCE        ISO time; meetings that ended before it are skipped (default: first start)
+  STATE_FILE           default ~/.local/state/uvi-meeting-finalizer.json
+  POLL_S               default 60
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import tempfile
+import time
+import wave
+from datetime import datetime, timezone
+
+import numpy as np
+import requests
+
+log = logging.getLogger("finalizer")
+
+VEXA = os.environ.get("VEXA_API_BASE", "http://127.0.0.1:18056").rstrip("/")
+VH = {"X-API-Key": os.environ["VEXA_API_KEY"]}
+UI = os.environ.get("VEXA_UI_URL", "").rstrip("/")
+SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+SLACK_CHANNEL = os.environ["SLACK_CHANNEL"]
+MODEL = os.environ.get("WHISPER_MODEL", "ivrit-ai/whisper-large-v3-turbo-ct2")
+THREADS = int(os.environ.get("WHISPER_THREADS", "2"))
+CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
+STATE_FILE = os.path.expanduser(os.environ.get("STATE_FILE", "~/.local/state/uvi-meeting-finalizer.json"))
+POLL_S = float(os.environ.get("POLL_S", "60"))
+
+SUMMARY_PROMPT = """You are writing the meeting summary for an Israeli startup's internal Slack channel.
+The text on stdin is an automatic Hebrew transcript of a recorded meeting (it has transcription errors;
+infer the intended meaning, never invent facts that aren't there). Speaker labels come from Google Meet;
+in-room participants may share one label.
+
+Write the summary in Hebrew, in Slack mrkdwn (*bold*, bullet lines starting with "• "), with these sections,
+omitting any that would be empty:
+*תקציר* — 2–4 sentences.
+*החלטות*
+*משימות* — "• <מי>: <מה>" (owner if stated, otherwise "לא הוגדר").
+*שאלות פתוחות*
+Keep product/tech names in their usual English spelling (e.g. Uvi, Naboo, Shraga, graf, CSA, SQLite).
+Output only the summary, no preamble. If the transcript is too short or garbled to summarize, say so in one line."""
+
+_model = None
+
+
+def whisper():
+    global _model
+    if _model is None:
+        from faster_whisper import WhisperModel
+        _model = WhisperModel(MODEL, device="cpu", compute_type="int8", cpu_threads=THREADS)
+    return _model
+
+
+def parse(ts: str | None) -> datetime | None:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, STATE_FILE)
+
+
+def vexa(path: str, **kw) -> requests.Response:
+    r = requests.get(f"{VEXA}{path}", headers=VH, timeout=60, **kw)
+    r.raise_for_status()
+    return r
+
+
+def recording_for(meeting_id: int) -> dict | None:
+    for rec in vexa("/recordings", params={"limit": 100}).json().get("recordings", []):
+        if rec.get("meeting_id") == meeting_id and rec.get("status") == "completed":
+            audio = [m for m in rec.get("media_files", []) if m.get("type") == "audio"]
+            if audio:
+                return {"id": rec["id"], "media": audio[0]["id"], "created_at": rec.get("created_at")}
+    return None
+
+
+def to_wav(src: str, dst: str) -> np.ndarray:
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-ac", "1", "-ar", "16000", dst], check=True)
+    with wave.open(dst) as w:
+        return np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def speaker_at(live: list[dict], t0: float, t1: float) -> str:
+    best, best_ov = "", 0.0
+    for s in live:
+        ov = min(t1, s["end"]) - max(t0, s["start"])
+        if ov > best_ov:
+            best, best_ov = s.get("speaker") or "", ov
+    return best
+
+
+def transcribe(meeting: dict, rec: dict, workdir: str) -> list[dict]:
+    src = os.path.join(workdir, "audio.webm")
+    with requests.get(f"{VEXA}/recordings/{rec['id']}/media/{rec['media']}/download", headers=VH, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(src, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+    audio = to_wav(src, os.path.join(workdir, "audio.wav"))
+    segs, _ = whisper().transcribe(audio, language="he", vad_filter=True, beam_size=5, condition_on_previous_text=False)
+
+    live = vexa(f"/transcripts/google_meet/{meeting['native_meeting_id']}").json().get("segments", [])
+    rec_start = (parse(rec.get("created_at")) or parse(meeting.get("start_time"))).timestamp()
+    out: list[dict] = []
+    for s in segs:
+        text = s.text.strip()
+        if not text:
+            continue
+        spk = speaker_at(live, rec_start + s.start, rec_start + s.end) or "?"
+        if out and out[-1]["speaker"] == spk and s.start - out[-1]["end"] < 2.0:
+            out[-1]["text"] += " " + text
+            out[-1]["end"] = s.end
+        else:
+            out.append({"speaker": spk, "start": s.start, "end": s.end, "text": text})
+    return out
+
+
+def as_text(lines: list[dict]) -> str:
+    return "\n".join(f"[{int(l['start'] // 60):02d}:{int(l['start'] % 60):02d}] {l['speaker']}: {l['text']}" for l in lines)
+
+
+def summarize(transcript: str) -> str:
+    r = subprocess.run([CLAUDE, "-p", SUMMARY_PROMPT, "--output-format", "text"], input=transcript,
+                       capture_output=True, text=True, timeout=600)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise RuntimeError(f"claude failed ({r.returncode}): {r.stderr.strip()[:300]}")
+    return r.stdout.strip()
+
+
+def slack(method: str, **payload) -> dict:
+    r = requests.post(f"https://slack.com/api/{method}", headers={"Authorization": f"Bearer {SLACK_TOKEN}"}, json=payload, timeout=30)
+    d = r.json()
+    if not d.get("ok"):
+        raise RuntimeError(f"slack {method}: {d.get('error')}")
+    return d
+
+
+def post(meeting: dict, title: str, summary: str, transcript: str, minutes: int) -> None:
+    speakers = sorted({l.split("] ", 1)[1].split(":", 1)[0] for l in transcript.splitlines() if "] " in l} - {"?"})
+    started = parse(meeting.get("start_time"))
+    when = started.astimezone().strftime("%d/%m/%Y %H:%M") if started else ""
+    link = f"<{UI}|פתיחה ב-Vexa>" if UI else ""
+    header = f":memo: *{title}* · {when} · {minutes} דק׳" + (f" · {', '.join(speakers)}" if speakers else "")
+    msg = slack("chat.postMessage", channel=SLACK_CHANNEL, text=f"{header}\n\n{summary}\n\n{link}".strip(), unfurl_links=False)
+    data = transcript.encode("utf-8")
+    up = requests.get("https://slack.com/api/files.getUploadURLExternal", headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
+                      params={"filename": "transcript.txt", "length": len(data)}, timeout=30).json()
+    if not up.get("ok"):
+        raise RuntimeError(f"slack files.getUploadURLExternal: {up.get('error')}")
+    requests.post(up["upload_url"], data=data, timeout=60).raise_for_status()
+    slack("files.completeUploadExternal", files=[{"id": up["file_id"], "title": f"תמלול — {title}"}],
+          channel_id=SLACK_CHANNEL, thread_ts=msg["ts"], initial_comment="התמלול המלא (ivrit.ai, מההקלטה המלאה)")
+
+
+def process(meeting: dict) -> str:
+    rec = recording_for(meeting["id"])
+    if not rec:
+        return "waiting-for-recording"
+    title = (meeting.get("data") or {}).get("title") or meeting.get("title") or meeting["native_meeting_id"]
+    with tempfile.TemporaryDirectory() as wd:
+        t = time.time()
+        lines = transcribe(meeting, rec, wd)
+        log.info("meeting %s: transcribed %d lines in %.0fs", meeting["id"], len(lines), time.time() - t)
+    if not lines:
+        return "empty"
+    transcript = as_text(lines)
+    summary = summarize(transcript)
+    minutes = max(1, round(lines[-1]["end"] / 60))
+    post(meeting, title, summary, transcript, minutes)
+    log.info("meeting %s: posted to Slack", meeting["id"])
+    return "posted"
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    state = load_state()
+    since = parse(os.environ.get("PROCESS_SINCE") or state.get("_since")) or datetime.now(timezone.utc)
+    state["_since"] = since.isoformat()
+    save_state(state)
+    log.info("finalizer up: model=%s threads=%d since=%s", MODEL, THREADS, since.isoformat())
+    while True:
+        try:
+            for m in vexa("/meetings", params={"limit": 100}).json().get("meetings", []):
+                key = str(m["id"])
+                ended = parse(m.get("end_time"))
+                if m.get("status") != "completed" or not ended or ended < since or m.get("platform") != "google_meet":
+                    continue
+                entry = state.get(key) or {}
+                if entry.get("status") in ("posted", "empty") or entry.get("attempts", 0) >= 3:
+                    continue
+                if entry.get("status") == "waiting-for-recording" and (datetime.now(timezone.utc) - ended).total_seconds() > 3600:
+                    continue  # no recording an hour after the end — give up quietly
+                try:
+                    entry["status"] = process(m)
+                except Exception as e:
+                    log.error("meeting %s failed: %s", key, e)
+                    entry["status"] = f"error: {e}"[:200]
+                    entry["attempts"] = entry.get("attempts", 0) + 1
+                state[key] = entry
+                save_state(state)
+        except Exception as e:
+            log.error("poll failed: %s", e)
+        time.sleep(POLL_S)
+
+
+if __name__ == "__main__":
+    main()
