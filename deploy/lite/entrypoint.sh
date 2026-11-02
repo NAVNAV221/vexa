@@ -51,6 +51,7 @@ export ADMIN_API_TOKEN="${ADMIN_API_TOKEN:-${ADMIN_TOKEN:-$(python3 -c "import s
 # nobody's to guess; set INTERNAL_API_SECRET explicitly when something outside talks in.
 export INTERNAL_API_SECRET="${INTERNAL_API_SECRET:-$(python3 -c "import secrets; print(secrets.token_hex(32))")}"
 export DEFAULT_BOT_NAME="${DEFAULT_BOT_NAME:-Vexa}"
+export DEFAULT_BOT_LANGUAGE="${DEFAULT_BOT_LANGUAGE:-}"
 
 # Optional Google Meet speaker-stream tuning. Empty values preserve bot defaults; the runtime
 # profile forwards configured values to every spawned bot process.

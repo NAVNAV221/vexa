@@ -223,6 +223,7 @@ meetingApi:
     port: 8080
   defaultBotName: "Vexa"    # the bot's display name; the terminal omits bot_name so this is what
                             # participants see. Blank it to get the service's VexaBot-{random}.
+  defaultBotLanguage: ""  # ISO-639-1 language a spawn gets when the request names none (e.g. "he"); empty = STT auto-detect
   transcriptionServiceUrl: ""   # STT endpoint the spawned bot transcribes against (empty ⇒ capture only)
   # Optional service-authority.v1 adapter JSON. Empty preserves stock OSS allow-all. A configured
   # authority must use failure_policy=closed and mode=enforce|observe; the secret lives under

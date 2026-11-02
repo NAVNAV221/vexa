@@ -114,6 +114,12 @@
    "description": "server-side bot participant name used by POST /bots when bot_name is omitted"
   },
   {
+   "key": "DEFAULT_BOT_LANGUAGE",
+   "class": "defaulted",
+   "default": "(unset — the spawn carries no language and STT auto-detects)",
+   "description": "transcription language (ISO-639-1, e.g. he) a spawn gets when the request names none, including calendar auto-join"
+  },
+  {
    "key": "TRANSCRIPTION_SERVICE_URL",
    "class": "capability",
    "capability": "stt",
