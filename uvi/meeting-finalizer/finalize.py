@@ -1,8 +1,9 @@
-"""After-meeting pass: full-recording Hebrew transcript (ivrit.ai) → Claude summary → Slack.
+"""After-meeting pass: full-recording Hebrew transcript → Claude summary → Slack (+ Vexa).
 
-Vexa's live transcript is built from short per-speaker windows, which is weak for Hebrew. Once a
-meeting completes, this job re-transcribes the whole recording with an ivrit.ai Whisper model
-(faster-whisper, CPU), attributes speakers from Vexa's live segments by time overlap, asks the
+Vexa's live transcript is built from short per-speaker windows. Once a meeting completes, this job
+re-transcribes the whole recording — through an OpenAI-compatible transcription API (default:
+OpenRouter's microsoft/mai-transcribe-2, sent as 10-minute mono Opus pieces), falling back to a
+local ivrit.ai Whisper model (faster-whisper, CPU) if the API fails — attributes speakers from Vexa's live segments by time overlap, asks the
 `claude` CLI (the host's Claude Code login) for a Hebrew summary, and posts it to a Slack channel
 with the full transcript attached in the thread.
 
@@ -14,7 +15,11 @@ Env:
   VEXA_UI_URL          e.g. https://meetings.example.com (link in the Slack post)
   SLACK_BOT_TOKEN      bot token with chat:write + files:write
   SLACK_CHANNEL        channel id
-  WHISPER_MODEL        default ivrit-ai/whisper-large-v3-turbo-ct2
+  FINAL_STT_URL        default https://openrouter.ai/api/v1/audio/transcriptions
+  FINAL_STT_MODEL      default microsoft/mai-transcribe-2 (empty → local ivrit.ai only)
+  FINAL_STT_KEY_FILE   file holding the API key for FINAL_STT_URL
+  FINAL_STT_CHUNK_S    default 600
+  WHISPER_MODEL        fallback, default ivrit-ai/whisper-large-v3-turbo-ct2
   WHISPER_THREADS      default 2 (leave room for live bots)
   CLAUDE_BIN           default claude
   PROCESS_SINCE        ISO time; meetings that ended before it are skipped (default: first start)
@@ -46,6 +51,10 @@ UI = os.environ.get("VEXA_UI_URL", "").rstrip("/")
 SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL = os.environ["SLACK_CHANNEL"]
 MODEL = os.environ.get("WHISPER_MODEL", "ivrit-ai/whisper-large-v3-turbo-ct2")
+STT_URL = os.environ.get("FINAL_STT_URL", "https://openrouter.ai/api/v1/audio/transcriptions")
+STT_MODEL = os.environ.get("FINAL_STT_MODEL", "microsoft/mai-transcribe-2")
+STT_KEY_FILE = os.path.expanduser(os.environ.get("FINAL_STT_KEY_FILE", ""))
+CHUNK_S = int(os.environ.get("FINAL_STT_CHUNK_S", "600"))
 THREADS = int(os.environ.get("WHISPER_THREADS", "2"))
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 STATE_FILE = os.path.expanduser(os.environ.get("STATE_FILE", "~/.local/state/uvi-meeting-finalizer.json"))
@@ -129,32 +138,75 @@ def speaker_at(live: list[dict], t0: float, t1: float) -> str:
     return best
 
 
-def transcribe(meeting: dict, rec: dict, workdir: str) -> list[dict]:
+def api_segments(src: str, workdir: str) -> list[tuple[float, float, str]]:
+    """Full recording → (start, end, text) via the transcription API, in CHUNK_S mono-Opus pieces."""
+    with open(STT_KEY_FILE) as f:
+        key = f.read().strip()
+    parts = os.path.join(workdir, "part%03d.ogg")
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-ac", "1", "-ar", "16000",
+                    "-c:a", "libopus", "-b:a", "32k", "-f", "segment", "-segment_time", str(CHUNK_S), parts], check=True)
+    out: list[tuple[float, float, str]] = []
+    for i, name in enumerate(sorted(n for n in os.listdir(workdir) if n.startswith("part") and n.endswith(".ogg"))):
+        for attempt in range(5):
+            with open(os.path.join(workdir, name), "rb") as f:
+                r = requests.post(STT_URL, headers={"Authorization": f"Bearer {key}"}, timeout=600,
+                                  data={"model": STT_MODEL, "language": "he", "response_format": "verbose_json"},
+                                  files={"file": (name, f, "audio/ogg")})
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < 4:
+                time.sleep(5 * (attempt + 1) ** 2)
+                continue
+            r.raise_for_status()
+            break
+        body = r.json()
+        off = i * CHUNK_S
+        segs = body.get("segments") or []
+        if segs:
+            out += [(off + float(s["start"]), off + float(s["end"]), s.get("text", "")) for s in segs]
+        elif body.get("text"):
+            out.append((off, off + CHUNK_S, body["text"]))
+    return out
+
+
+def local_segments(src: str, workdir: str) -> list[tuple[float, float, str]]:
+    audio = to_wav(src, os.path.join(workdir, "audio.wav"))
+    segs, _ = whisper().transcribe(audio, language="he", vad_filter=True, beam_size=5, condition_on_previous_text=False)
+    return [(s.start, s.end, s.text) for s in segs]
+
+
+def transcribe(meeting: dict, rec: dict, workdir: str) -> tuple[list[dict], str]:
     src = os.path.join(workdir, "audio.webm")
     with requests.get(f"{VEXA}/recordings/{rec['id']}/media/{rec['media']}/download", headers=VH, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(src, "wb") as f:
             for chunk in r.iter_content(1 << 20):
                 f.write(chunk)
-    audio = to_wav(src, os.path.join(workdir, "audio.wav"))
-    segs, _ = whisper().transcribe(audio, language="he", vad_filter=True, beam_size=5, condition_on_previous_text=False)
+    engine = STT_MODEL
+    segs = None
+    if STT_MODEL and STT_KEY_FILE:
+        try:
+            segs = api_segments(src, workdir)
+        except Exception as e:
+            log.warning("meeting %s: %s failed (%s) — falling back to %s", meeting["id"], STT_MODEL, e, MODEL)
+    if segs is None:
+        engine = MODEL
+        segs = local_segments(src, workdir)
 
     live = vexa(f"/transcripts/google_meet/{meeting['native_meeting_id']}").json().get("segments", [])
     rec_start = (parse(rec.get("created_at")) or parse(meeting.get("start_time"))).timestamp()
     out: list[dict] = []
-    for s in segs:
-        text = s.text.strip()
+    for start, end, raw in segs:
+        text = (raw or "").strip()
         if not text:
             continue
-        spk = speaker_at(live, rec_start + s.start, rec_start + s.end) or "?"
-        if out and out[-1]["speaker"] == spk and s.start - out[-1]["end"] < 2.0:
+        spk = speaker_at(live, rec_start + start, rec_start + end) or "?"
+        if out and out[-1]["speaker"] == spk and start - out[-1]["end"] < 2.0:
             out[-1]["text"] += " " + text
-            out[-1]["end"] = s.end
+            out[-1]["end"] = end
         else:
-            out.append({"speaker": spk, "start": s.start, "end": s.end, "text": text})
+            out.append({"speaker": spk, "start": start, "end": end, "text": text})
     for line in out:
         line["abs_start"], line["abs_end"] = rec_start + line["start"], rec_start + line["end"]
-    return out
+    return out, engine
 
 
 def as_text(lines: list[dict]) -> str:
@@ -206,7 +258,7 @@ def replace_vexa_transcript(meeting_id: int, lines: list[dict]) -> None:
     subprocess.run(["docker", "exec", REDIS, "redis-cli", "DEL", f"meeting:{mid}:segments"], capture_output=True, timeout=30)
 
 
-def post(meeting: dict, title: str, summary: str, transcript: str, minutes: int) -> None:
+def post(meeting: dict, title: str, summary: str, transcript: str, minutes: int, engine: str) -> None:
     speakers = sorted({l.split("] ", 1)[1].split(":", 1)[0] for l in transcript.splitlines() if "] " in l} - {"?"})
     started = parse(meeting.get("start_time"))
     when = started.astimezone().strftime("%d/%m/%Y %H:%M") if started else ""
@@ -229,7 +281,7 @@ def post(meeting: dict, title: str, summary: str, transcript: str, minutes: int)
         raise RuntimeError(f"slack files.getUploadURLExternal: {up.get('error')}")
     requests.post(up["upload_url"], data=data, timeout=60).raise_for_status()
     slack("files.completeUploadExternal", files=[{"id": up["file_id"], "title": f"תמלול — {title}"}],
-          channel_id=SLACK_CHANNEL, thread_ts=msg["ts"], initial_comment="התמלול המלא (ivrit.ai, מההקלטה המלאה)")
+          channel_id=SLACK_CHANNEL, thread_ts=msg["ts"], initial_comment=f"התמלול המלא מההקלטה ({engine.split('/')[-1]})")
 
 
 def process(meeting: dict, entry: dict) -> str:
@@ -239,8 +291,8 @@ def process(meeting: dict, entry: dict) -> str:
     title = (meeting.get("data") or {}).get("title") or meeting.get("title") or meeting["native_meeting_id"]
     with tempfile.TemporaryDirectory() as wd:
         t = time.time()
-        lines = transcribe(meeting, rec, wd)
-        log.info("meeting %s: transcribed %d lines in %.0fs", meeting["id"], len(lines), time.time() - t)
+        lines, engine = transcribe(meeting, rec, wd)
+        log.info("meeting %s: transcribed %d lines in %.0fs with %s", meeting["id"], len(lines), time.time() - t, engine)
     if not lines:
         return "empty"
     if not entry.get("written"):
@@ -252,7 +304,7 @@ def process(meeting: dict, entry: dict) -> str:
     transcript = as_text(lines)
     summary = summarize(transcript)
     minutes = max(1, round(lines[-1]["end"] / 60))
-    post(meeting, title, summary, transcript, minutes)
+    post(meeting, title, summary, transcript, minutes, engine)
     log.info("meeting %s: posted to Slack", meeting["id"])
     return "posted"
 

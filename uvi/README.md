@@ -22,7 +22,8 @@ everything else is stock Vexa from upstream (`Vexa-ai/vexa`), plus the small pat
 2. Build the patched images: `make -C deploy/compose bot BOT_IMAGE=vexa/vexa-bot:uvi`, then
    `docker compose -p vexa-v012 --env-file deploy/compose/.env -f deploy/compose/docker-compose.yml build meeting-api terminal`.
 3. In `deploy/compose/.env` set:
-   - STT: `TRANSCRIPTION_SERVICE_URL=https://api.openai.com`, `TRANSCRIPTION_SERVICE_TOKEN=<OpenAI key>`, `TRANSCRIPTION_MODEL=gpt-4o-transcribe`
+   - STT (live): `TRANSCRIPTION_SERVICE_URL=https://openrouter.ai/api`, `TRANSCRIPTION_SERVICE_TOKEN=<OpenRouter key>`,
+     `TRANSCRIPTION_MODEL=microsoft/mai-transcribe-2` (best Hebrew in our bake-off; the after-meeting pass uses it too)
    - Agent model: `HOST_CLAUDE_CREDENTIALS=/home/<user>/.claude/.credentials.json` after `claude` → `/login` on the host
    - Bot: `BROWSER_IMAGE=vexa/vexa-bot:uvi`, `DEFAULT_BOT_NAME=Shraga`, `DEFAULT_BOT_LANGUAGE=he`
    - Signed-in bot: `BOT_AUTHENTICATED=true`, `BOT_USERDATA_S3_PATH=userdata/<bot>`, `BOT_S3_ENDPOINT=http://storage:9000`,
@@ -34,6 +35,7 @@ everything else is stock Vexa from upstream (`Vexa-ai/vexa`), plus the small pat
    Xvfb + x11vnc, connect with a VNC client over an SSH tunnel, sign in. The session lands in the
    scoped userdata prefix.
 5. Calendar: see [`calendar-sync/`](calendar-sync/README.md).
+6. After-meeting transcript + summary to Slack: see [`meeting-finalizer/`](meeting-finalizer/README.md).
 
 ## Exposure
 
