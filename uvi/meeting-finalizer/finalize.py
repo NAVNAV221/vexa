@@ -32,6 +32,8 @@ Env:
                        attendees, language)
   ROSTER_FILE          default ~/.config/uvi/team_roster.json ({email: {displayName, slackId}})
   DEFAULT_LANGUAGE     default he — a meeting is English when its title (or invite) carries [EN]
+  WORKSPACE_ID         optional — bind each finalized meeting to this shared workspace (covers meetings
+                       started by pasting a link, which calendar-sync never planned)
 
 Slack post: one short message — title, date, length, participants as @mentions, a link to the meeting —
 with summary.md and transcript.md attached (Hebrew right-to-left text reads badly inline in Slack).
@@ -74,6 +76,7 @@ META_DIR = os.path.expanduser(os.environ.get("META_DIR", "~/.local/state/uvi-cal
 ROSTER_FILE = os.path.expanduser(os.environ.get("ROSTER_FILE", "~/.config/uvi/team_roster.json"))
 DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "he")
 LANG_RE = re.compile(r"(?:\[|\b(?:lang(?:uage)?\s*[:=]\s*))(en|he)\]?", re.IGNORECASE)
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "").strip()
 BOT_EMAILS = {e.strip().lower() for e in os.environ.get("BOT_EMAILS", "shraga@uvi.io").split(",") if e.strip()}
 
 SUMMARY_PROMPT = {
@@ -466,6 +469,9 @@ def process(meeting: dict, entry: dict) -> str:
         log.info("meeting %s: transcribed %d lines in %.0fs with %s (%s)", meeting["id"], len(lines), time.time() - t, engine, language)
     if not lines:
         return "empty"
+    if WORKSPACE_ID and not meeting.get("workspace_id"):
+        requests.post(f"{VEXA}/meetings/google_meet/{meeting['native_meeting_id']}/workspace", headers=VH,
+                      json={"workspace_id": WORKSPACE_ID}, timeout=30)
     if not entry.get("written"):
         replace_vexa_transcript(meeting["id"], lines, language)
         entry["written"] = True

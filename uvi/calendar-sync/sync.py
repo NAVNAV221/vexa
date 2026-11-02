@@ -29,6 +29,8 @@ Env:
   STATE_FILE                  default /state/calendar-sync.json
   END_GRACE_MIN               stop a still-running bot this long after the event ends (default 5)
   META_DIR                    default /state/meetings
+  WORKSPACE_ID                optional — bind every planned meeting to this shared Vexa workspace, so its
+                              members (not only the key's owner) see the meeting and its transcript
 """
 from __future__ import annotations
 
@@ -59,6 +61,7 @@ END_GRACE = timedelta(minutes=float(os.environ.get("END_GRACE_MIN", "5")))
 LIVE = {"requested", "joining", "awaiting_admission", "needs_help", "active"}
 ENDS: dict[str, datetime] = {}  # Meet code → calendar end of the occurrence the bot is for
 META_DIR = os.environ.get("META_DIR", "/state/meetings")
+WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "").strip()
 LANG_RE = re.compile(r"(?:\[|\b(?:lang(?:uage)?\s*[:=]\s*))(en|he)\]?", re.IGNORECASE)
 
 
@@ -210,10 +213,11 @@ def sync_once(state: dict[str, int]) -> None:
                                    json={"scheduled_at": iso(ev["start"]), "auto_join": True}, timeout=20)
                 log.info("moved %s → %s (%s)", code, iso(ev["start"]), r.status_code)
             continue
-        r = requests.post(f"{VEXA}/meetings", headers=VEXA_HEADERS, timeout=20, json={
-            "title": ev["title"], "scheduled_at": iso(ev["start"]),
-            "meeting_url": f"https://meet.google.com/{code}", "auto_join": True,
-        })
+        body = {"title": ev["title"], "scheduled_at": iso(ev["start"]),
+                "meeting_url": f"https://meet.google.com/{code}", "auto_join": True}
+        if WORKSPACE_ID:
+            body["workspace_id"] = WORKSPACE_ID
+        r = requests.post(f"{VEXA}/meetings", headers=VEXA_HEADERS, timeout=20, json=body)
         if r.status_code in (200, 201):
             state[code] = r.json()["id"]
             log.info("planned %s at %s: %s", code, iso(ev["start"]), ev["title"])
