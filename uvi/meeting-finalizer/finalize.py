@@ -412,6 +412,12 @@ def replace_vexa_transcript(meeting_id: int, lines: list[dict], language: str = 
     subprocess.run(["docker", "exec", REDIS, "redis-cli", "DEL", f"meeting:{mid}:segments"], capture_output=True, timeout=30)
 
 
+def line_md(l: dict) -> str:
+    stamp = "[%02d:%02d]" % (int(l["start"] // 60), int(l["start"] % 60))
+    who = l["speaker"] if l["speaker"] != "?" else ""
+    return "**" + (stamp + " " + who).strip() + "** " + l["text"]
+
+
 def upload_files(files: list[tuple[str, str, str]], comment: str) -> None:
     """files = [(filename, title, text)] → one Slack message carrying them, with `comment` as its text."""
     ids = []
@@ -441,8 +447,7 @@ def post(meeting: dict, title: str, summary_md: str, lines: list[dict], minutes:
     meta_line = f"{when} · {minutes} {lab['min']}" + (f" · {plain_who}" if plain_who else "")
     summary_doc = f"# {title}\n\n{meta_line}\n\n{summary_md}\n"
     transcript_doc = f"# {lab['transcript']} — {title}\n\n{meta_line} · {engine.split('/')[-1]}\n\n" + "\n\n".join(
-        f"**{(f'[{int(l['start'] // 60):02d}:{int(l['start'] % 60):02d}] ' + (l['speaker'] if l['speaker'] != '?' else '')).strip()}** {l['text']}"
-        for l in lines) + "\n"
+        line_md(l) for l in lines) + "\n"
     stamp = (started or datetime.now(timezone.utc)).astimezone().strftime("%Y-%m-%d")
     upload_files([(f"summary-{stamp}.md", f"Summary — {title}", summary_doc),
                   (f"transcript-{stamp}.md", f"Transcript — {title}", transcript_doc)], comment)
