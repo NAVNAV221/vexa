@@ -116,8 +116,10 @@ Then these sections, omitting any that would be empty:
 No preamble. If the transcript is too short or garbled to summarize, write `TITLE:` and one line saying so.""",
 }
 LABELS = {
-    "he": {"participants": "Participants", "open": "Open in Vexa", "min": "min", "transcript": "Transcript"},
-    "en": {"participants": "Participants", "open": "Open in Vexa", "min": "min", "transcript": "Transcript"},
+    "he": {"participants": "Participants", "open": "Open in Vexa", "min": "min", "transcript": "Transcript",
+           "doc_min": "דק׳", "doc_transcript": "תמלול"},
+    "en": {"participants": "Participants", "open": "Open in Vexa", "min": "min", "transcript": "Transcript",
+           "doc_min": "min", "doc_transcript": "Transcript"},
 }
 
 _model = None
@@ -508,9 +510,9 @@ def post(meeting: dict, title: str, summary_md: str, lines: list[dict], minutes:
         parts.append(f"<{UI}/meetings/{meeting['id']}|{lab['open']}>")
     comment_parts = parts
     plain_who = ", ".join(sorted({l["speaker"] for l in lines if l["speaker"] != "?"}))
-    meta_line = f"{when} · {minutes} {lab['min']}" + (f" · {plain_who}" if plain_who else "")
+    meta_line = f"{when} · {minutes} {lab['doc_min']}" + (f" · {plain_who}" if plain_who else "")
     summary_doc = f"# {title}\n\n{meta_line}\n\n{summary_md}\n"
-    transcript_doc = f"# {lab['transcript']} — {title}\n\n{meta_line} · {engine.split('/')[-1]}\n\n" + "\n\n".join(
+    transcript_doc = f"# {lab['doc_transcript']} — {title}\n\n{meta_line} · {engine.split('/')[-1]}\n\n" + "\n\n".join(
         line_md(l) for l in lines) + "\n"
     stamp = (started or datetime.now(timezone.utc)).astimezone().strftime("%Y-%m-%d")
     if DRIVE_FOLDER_ID and SA_KEY_FILE:
