@@ -2,9 +2,9 @@
 
 Vexa runs our meeting bot ("Shraga"): it joins Google Meet signed in as a Workspace user, transcribes
 Hebrew live, and keeps transcripts and notes. This folder holds what is specific to our deployment;
-everything else is stock Vexa from upstream (`Vexa-ai/vexa`), plus the small patches on this branch.
+everything else is stock Vexa from upstream (`Vexa-ai/vexa`), plus the small patches on `main`.
 
-## Patches on this branch (vs upstream)
+## Patches (vs upstream `Vexa-ai/vexa`)
 
 | Change | Why |
 |---|---|
@@ -17,7 +17,7 @@ everything else is stock Vexa from upstream (`Vexa-ai/vexa`), plus the small pat
 
 ## Setup on a server (Linux, amd64)
 
-1. `git clone -b fix/authenticated-bot-no-incognito <this repo> vexa && cd vexa && make all`
+1. `git clone <this repo> vexa && cd vexa && make all`
    (seeds `deploy/compose/.env`, pulls images, starts the stack on 127.0.0.1 ports).
 2. Build the patched images: `make -C deploy/compose bot BOT_IMAGE=vexa/vexa-bot:uvi`, then
    `docker compose -p vexa-v012 --env-file deploy/compose/.env -f deploy/compose/docker-compose.yml build meeting-api terminal`.
