@@ -2,7 +2,7 @@
 
 Vexa's live transcript is built from short per-speaker windows. Once a meeting completes, this job
 re-transcribes the whole recording — through an OpenAI-compatible transcription API (default:
-OpenRouter's microsoft/mai-transcribe-2, sent as 10-minute mono MP3 pieces), falling back to a
+OpenRouter's elevenlabs/scribe-v2, sent as 10-minute mono MP3 pieces), falling back to a
 local ivrit.ai Whisper model (faster-whisper, CPU) if the API fails — attributes speakers from Vexa's live segments by time overlap, asks the
 `claude` CLI (the host's Claude Code login) for a Hebrew summary, and posts it to a Slack channel
 with the full transcript attached in the thread.
@@ -16,7 +16,7 @@ Env:
   SLACK_BOT_TOKEN      bot token with chat:write + files:write
   SLACK_CHANNEL        channel id
   FINAL_STT_URL        default https://openrouter.ai/api/v1/audio/transcriptions
-  FINAL_STT_MODEL      default microsoft/mai-transcribe-2 (empty → local ivrit.ai only)
+  FINAL_STT_MODEL      default elevenlabs/scribe-v2 (empty → local ivrit.ai only)
   FINAL_STT_KEY_FILE   file holding the API key for FINAL_STT_URL
   FINAL_STT_CHUNK_S    default 600
   WHISPER_MODEL        fallback, default ivrit-ai/whisper-large-v3-turbo-ct2
@@ -52,7 +52,7 @@ SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_CHANNEL = os.environ["SLACK_CHANNEL"]
 MODEL = os.environ.get("WHISPER_MODEL", "ivrit-ai/whisper-large-v3-turbo-ct2")
 STT_URL = os.environ.get("FINAL_STT_URL", "https://openrouter.ai/api/v1/audio/transcriptions")
-STT_MODEL = os.environ.get("FINAL_STT_MODEL", "microsoft/mai-transcribe-2")
+STT_MODEL = os.environ.get("FINAL_STT_MODEL", "elevenlabs/scribe-v2")
 STT_KEY_FILE = os.path.expanduser(os.environ.get("FINAL_STT_KEY_FILE", ""))
 CHUNK_S = int(os.environ.get("FINAL_STT_CHUNK_S", "600"))
 THREADS = int(os.environ.get("WHISPER_THREADS", "2"))
@@ -142,6 +142,23 @@ def speaker_at(live: list[dict], t0: float, t1: float) -> str:
     return best or near
 
 
+def words_to_segments(words: list[dict], off: float) -> list[tuple[float, float, str]]:
+    """Group word timestamps into sentence-like segments: break on end punctuation, a pause > 0.8 s, or 15 s."""
+    out: list[tuple[float, float, str]] = []
+    cur: list[dict] = []
+    for w in words:
+        if cur and (w["start"] - cur[-1]["end"] > 0.8 or w["end"] - cur[0]["start"] > 15):
+            out.append((off + cur[0]["start"], off + cur[-1]["end"], " ".join(x["word"].strip() for x in cur)))
+            cur = []
+        cur.append(w)
+        if w["word"].rstrip().endswith((".", "?", "!")):
+            out.append((off + cur[0]["start"], off + cur[-1]["end"], " ".join(x["word"].strip() for x in cur)))
+            cur = []
+    if cur:
+        out.append((off + cur[0]["start"], off + cur[-1]["end"], " ".join(x["word"].strip() for x in cur)))
+    return out
+
+
 def api_segments(src: str, workdir: str) -> list[tuple[float, float, str]]:
     """Full recording → (start, end, text) via the transcription API, in CHUNK_S mono MP3 pieces
     (MAI-Transcribe 2 rejects Opus re-encoded from the recording's WebM; MP3 is accepted)."""
@@ -155,7 +172,8 @@ def api_segments(src: str, workdir: str) -> list[tuple[float, float, str]]:
         for attempt in range(5):
             with open(os.path.join(workdir, name), "rb") as f:
                 r = requests.post(STT_URL, headers={"Authorization": f"Bearer {key}"}, timeout=600,
-                                  data={"model": STT_MODEL, "language": "he", "response_format": "verbose_json"},
+                                  data={"model": STT_MODEL, "language": "he", "response_format": "verbose_json",
+                                        "timestamp_granularities[]": "word"},
                                   files={"file": (name, f, "audio/mpeg")})
             if r.status_code in (429, 500, 502, 503, 504) and attempt < 4:
                 time.sleep(5 * (attempt + 1) ** 2)
@@ -165,7 +183,10 @@ def api_segments(src: str, workdir: str) -> list[tuple[float, float, str]]:
         body = r.json()
         off = i * CHUNK_S
         segs = body.get("segments") or []
-        if segs:
+        words = [w for w in (body.get("words") or []) if w.get("word", "").strip() and "start" in w]
+        if words and len(segs) <= 1:  # e.g. Scribe: one segment per piece, but word timings
+            out += words_to_segments(words, off)
+        elif segs:
             out += [(off + float(s["start"]), off + float(s["end"]), s.get("text", "")) for s in segs]
         elif body.get("text"):
             out.append((off, off + CHUNK_S, body["text"]))
