@@ -20,6 +20,9 @@ Env:
   PROCESS_SINCE        ISO time; meetings that ended before it are skipped (default: first start)
   STATE_FILE           default ~/.local/state/uvi-meeting-finalizer.json
   POLL_S               default 60
+  VEXA_PG_CONTAINER    default vexa-v012-postgres-1   (final transcript replaces the live one)
+  VEXA_REDIS_CONTAINER default vexa-v012-redis-1
+  BACKUP_DIR           default ~/.local/state/uvi-meeting-finalizer-backups (live transcript kept here)
 """
 from __future__ import annotations
 
@@ -47,6 +50,9 @@ THREADS = int(os.environ.get("WHISPER_THREADS", "2"))
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 STATE_FILE = os.path.expanduser(os.environ.get("STATE_FILE", "~/.local/state/uvi-meeting-finalizer.json"))
 POLL_S = float(os.environ.get("POLL_S", "60"))
+PG = os.environ.get("VEXA_PG_CONTAINER", "vexa-v012-postgres-1")
+REDIS = os.environ.get("VEXA_REDIS_CONTAINER", "vexa-v012-redis-1")
+BACKUP_DIR = os.path.expanduser(os.environ.get("BACKUP_DIR", "~/.local/state/uvi-meeting-finalizer-backups"))
 
 SUMMARY_PROMPT = """You are writing the meeting summary for an Israeli startup's internal Slack channel.
 The text on stdin is an automatic Hebrew transcript of a recorded meeting (it has transcription errors;
@@ -146,6 +152,8 @@ def transcribe(meeting: dict, rec: dict, workdir: str) -> list[dict]:
             out[-1]["end"] = s.end
         else:
             out.append({"speaker": spk, "start": s.start, "end": s.end, "text": text})
+    for line in out:
+        line["abs_start"], line["abs_end"] = rec_start + line["start"], rec_start + line["end"]
     return out
 
 
@@ -169,13 +177,51 @@ def slack(method: str, **payload) -> dict:
     return d
 
 
+def psql(sql: str) -> str:
+    r = subprocess.run(["docker", "exec", "-i", PG, "psql", "-U", "postgres", "-d", "vexa", "-v", "ON_ERROR_STOP=1", "-At"],
+                       input=sql, capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"psql: {r.stderr.strip()[:300]}")
+    return r.stdout
+
+
+def q(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
+
+
+def replace_vexa_transcript(meeting_id: int, lines: list[dict]) -> None:
+    """Swap the meeting's live segments for the final ones (live rows backed up to BACKUP_DIR first)."""
+    mid = int(meeting_id)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    backup_path = os.path.join(BACKUP_DIR, f"meeting-{mid}-live.json")
+    if not os.path.exists(backup_path):  # first write only — a rerun must not overwrite the live copy with final rows
+        backup = psql(f"SELECT coalesce(json_agg(t), '[]') FROM transcriptions t WHERE meeting_id = {mid};")
+        with open(backup_path, "w") as f:
+            f.write(backup)
+    values = ",\n".join(
+        f"({mid}, {l['abs_start']:.3f}, {l['abs_end']:.3f}, {q(l['text'])}, {q(l['speaker']) if l['speaker'] != '?' else 'NULL'}, 'he', 'final-{i:05d}', now())"
+        for i, l in enumerate(lines))
+    psql(f"BEGIN;\nDELETE FROM transcriptions WHERE meeting_id = {mid};\n"
+         f"INSERT INTO transcriptions (meeting_id, start_time, end_time, text, speaker, language, segment_id, created_at) VALUES\n{values};\nCOMMIT;\n")
+    subprocess.run(["docker", "exec", REDIS, "redis-cli", "DEL", f"meeting:{mid}:segments"], capture_output=True, timeout=30)
+
+
 def post(meeting: dict, title: str, summary: str, transcript: str, minutes: int) -> None:
     speakers = sorted({l.split("] ", 1)[1].split(":", 1)[0] for l in transcript.splitlines() if "] " in l} - {"?"})
     started = parse(meeting.get("start_time"))
     when = started.astimezone().strftime("%d/%m/%Y %H:%M") if started else ""
-    link = f"<{UI}|פתיחה ב-Vexa>" if UI else ""
+    link = f"<{UI}/meetings/{meeting['id']}|פתיחה ב-Vexa>" if UI else ""
     header = f":memo: *{title}* · {when} · {minutes} דק׳" + (f" · {', '.join(speakers)}" if speakers else "")
-    msg = slack("chat.postMessage", channel=SLACK_CHANNEL, text=f"{header}\n\n{summary}\n\n{link}".strip(), unfurl_links=False)
+    body = f"{header}\n\n{summary}\n\n{link}".strip()
+    # verbatim: Slack must not auto-link bare domains in Hebrew text ("מ-Naboo.ai" → a broken link)
+    chunks, cur = [], ""
+    for para in body.split("\n\n"):
+        if len(cur) + len(para) > 2800 and cur:
+            chunks.append(cur); cur = ""
+        cur = f"{cur}\n\n{para}" if cur else para
+    chunks.append(cur)
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": c[:3000], "verbatim": True}} for c in chunks]
+    msg = slack("chat.postMessage", channel=SLACK_CHANNEL, text=header, blocks=blocks, unfurl_links=False, unfurl_media=False)
     data = transcript.encode("utf-8")
     up = requests.get("https://slack.com/api/files.getUploadURLExternal", headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
                       params={"filename": "transcript.txt", "length": len(data)}, timeout=30).json()
@@ -186,7 +232,7 @@ def post(meeting: dict, title: str, summary: str, transcript: str, minutes: int)
           channel_id=SLACK_CHANNEL, thread_ts=msg["ts"], initial_comment="התמלול המלא (ivrit.ai, מההקלטה המלאה)")
 
 
-def process(meeting: dict) -> str:
+def process(meeting: dict, entry: dict) -> str:
     rec = recording_for(meeting["id"])
     if not rec:
         return "waiting-for-recording"
@@ -197,6 +243,12 @@ def process(meeting: dict) -> str:
         log.info("meeting %s: transcribed %d lines in %.0fs", meeting["id"], len(lines), time.time() - t)
     if not lines:
         return "empty"
+    if not entry.get("written"):
+        replace_vexa_transcript(meeting["id"], lines)
+        entry["written"] = True
+        log.info("meeting %s: final transcript written to Vexa", meeting["id"])
+    if entry.get("status") == "posted":
+        return "posted"
     transcript = as_text(lines)
     summary = summarize(transcript)
     minutes = max(1, round(lines[-1]["end"] / 60))
@@ -220,12 +272,14 @@ def main() -> None:
                 if m.get("status") != "completed" or not ended or ended < since or m.get("platform") != "google_meet":
                     continue
                 entry = state.get(key) or {}
-                if entry.get("status") in ("posted", "empty") or entry.get("attempts", 0) >= 3:
+                if isinstance(entry, str):  # first-version state: a bare status string
+                    entry = {"status": entry}
+                if (entry.get("status") in ("posted", "empty") and entry.get("written", entry.get("status") == "empty")) or entry.get("attempts", 0) >= 3:
                     continue
                 if entry.get("status") == "waiting-for-recording" and (datetime.now(timezone.utc) - ended).total_seconds() > 3600:
                     continue  # no recording an hour after the end — give up quietly
                 try:
-                    entry["status"] = process(m)
+                    entry["status"] = process(m, entry)
                 except Exception as e:
                     log.error("meeting %s failed: %s", key, e)
                     entry["status"] = f"error: {e}"[:200]
