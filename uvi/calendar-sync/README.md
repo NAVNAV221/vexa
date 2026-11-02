@@ -26,6 +26,12 @@ Meetings view. It also writes `<state>/meetings/<meet-code>.json` (title, times,
 language) for the after-meeting job; state lives in a host directory
 (`~/.local/state/uvi-calendar-sync`, writable by the container's uid 10001).
 
-**Language tag:** `[EN]` (or `lang: en`) in the event title or description marks an English meeting;
-`[HE]`/none = Hebrew. Vexa's own calendar page will say "No calendar connected" — this job plans the
+**Language tag:** `[EN]` / `lang: en` (any code in `LANGUAGES`, default `en,he`) in the event title or
+description selects the meeting language; untagged meetings use the finalizer's `DEFAULT_LANGUAGE`.
+
+**Ending bots:** a calendar bot is stopped `END_GRACE_MIN` (default 5) after the event's end. Meet gives
+bots no "alone in the call" signal, so set `IDLE_STOP_MIN` (e.g. 10) to also stop **any** running bot —
+including one sent to a pasted link — after that many minutes without new speech.
+
+`WORKSPACE_ID` binds every planned meeting to a shared Vexa workspace so all its members see it. Vexa's own calendar page will say "No calendar connected" — this job plans the
 meetings through the API instead of an ICS feed, which is expected.

@@ -16,7 +16,12 @@ State (which plans this job owns) lives in STATE_FILE so it never touches meetin
 
 For each planned meeting it also writes META_DIR/<meet-code>.json — title, start/end, attendee emails
 and the meeting language — for the after-meeting job (Slack mentions, transcription language). The
-language comes from a tag in the event title or description: [EN] English, [HE] Hebrew (default).
+language comes from a tag in the event title or description, e.g. `[EN]` or `lang: en`, for any code
+listed in LANGUAGES; untagged meetings get the after-meeting job's default.
+
+Bots end with the calendar event (END_GRACE_MIN after its end). Meet gives a bot no reliable "alone in
+the call" signal, so IDLE_STOP_MIN also stops ANY running bot the key can see — calendar or started from a
+pasted link — once its live transcript has had no new speech for that long.
 
 Env:
   CALENDAR_ID                 the calendar to read, e.g. bot@example.com (also the impersonated user)
@@ -28,6 +33,8 @@ Env:
   LOOKAHEAD_DAYS              default 7
   STATE_FILE                  default /state/calendar-sync.json
   END_GRACE_MIN               stop a still-running bot this long after the event ends (default 5)
+  IDLE_STOP_MIN               stop any running bot after this many minutes without new speech (0 = off; default 0)
+  LANGUAGES                   language codes a title/description tag may select (default "en,he")
   META_DIR                    default /state/meetings
   WORKSPACE_ID                optional — bind every planned meeting to this shared Vexa workspace, so its
                               members (not only the key's owner) see the meeting and its transcript
@@ -62,7 +69,10 @@ LIVE = {"requested", "joining", "awaiting_admission", "needs_help", "active"}
 ENDS: dict[str, datetime] = {}  # Meet code → calendar end of the occurrence the bot is for
 META_DIR = os.environ.get("META_DIR", "/state/meetings")
 WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "").strip()
-LANG_RE = re.compile(r"(?:\[|\b(?:lang(?:uage)?\s*[:=]\s*))(en|he)\]?", re.IGNORECASE)
+IDLE_STOP = timedelta(minutes=float(os.environ.get("IDLE_STOP_MIN", "0")))
+LANGUAGES = [c.strip().lower() for c in os.environ.get("LANGUAGES", "en,he").split(",") if c.strip()]
+LANG_RE = re.compile(r"(?:\[|\b(?:lang(?:uage)?\s*[:=]\s*))(" + "|".join(map(re.escape, LANGUAGES)) + r")\b\]?",
+                     re.IGNORECASE)
 
 
 def meeting_language(*texts: str) -> str | None:
@@ -243,6 +253,20 @@ def sync_once(state: dict[str, int]) -> None:
             log.info("stopped bot in %s: event ended %s (%s)", code, iso(end), r.status_code)
         if now > end + timedelta(hours=2) or (cur and cur.get("status") in {"completed", "failed"} and now > end):
             ENDS.pop(code, None)
+
+    if IDLE_STOP:
+        for code, cur in existing.items():
+            if cur.get("status") != "active":
+                continue
+            began = parse(cur.get("start_time"))
+            r = requests.get(f"{VEXA}/transcripts/google_meet/{code}", headers=VEXA_HEADERS, timeout=20)
+            if r.status_code != 200:
+                continue  # e.g. a workspace meeting another member owns — its owner's key stops it
+            last = max((float(s.get("end") or 0) for s in r.json().get("segments", [])), default=0.0)
+            quiet_since = datetime.fromtimestamp(last, timezone.utc) if last else began
+            if quiet_since and now - quiet_since > IDLE_STOP:
+                r = requests.delete(f"{VEXA}/bots/google_meet/{code}", headers=VEXA_HEADERS, timeout=20)
+                log.info("stopped bot in %s: no speech since %s (%s)", code, iso(quiet_since), r.status_code)
 
 
 def main() -> None:

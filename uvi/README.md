@@ -13,7 +13,8 @@ everything else is stock Vexa from upstream (`Vexa-ai/vexa`), plus the small pat
 | `DEFAULT_BOT_LANGUAGE` (meeting-api) | calendar/auto-join spawns get a language (we use `he`) |
 | `CALENDAR_SYNC_INTERVAL_S` surfaced in compose | faster ICS polling when ICS is used |
 | Terminal signs in with a verified Cloudflare Access identity | one sign-in at the edge, no second Vexa login |
-| `calendar-sync/` | calendar → planned meetings through a service account instead of a secret ICS link |
+| `calendar-sync/` | calendar → planned meetings through a service account instead of a secret ICS link; language tags; stops bots at event end or after silence |
+| `meeting-finalizer/` | after the meeting: full-recording transcript (OpenRouter, local ivrit.ai fallback), Claude summary, Slack post with @mentions, Google Doc |
 
 ## Setup on a server (Linux, amd64)
 

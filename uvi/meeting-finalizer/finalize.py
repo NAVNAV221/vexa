@@ -31,7 +31,12 @@ Env:
   META_DIR             default ~/.local/state/uvi-calendar-sync/meetings (calendar-sync's per-meeting title,
                        attendees, language)
   ROSTER_FILE          default ~/.config/uvi/team_roster.json ({email: {displayName, slackId}})
-  DEFAULT_LANGUAGE     default he — a meeting is English when its title (or invite) carries [EN]
+  DEFAULT_LANGUAGE     language of untagged meetings (default en); a tag in the title/invite such as
+                       [EN] or [HE] picks any code in LANGUAGES (default "en,he")
+  ORG_CONTEXT          one line about the organization for the summary prompt, e.g. "Acme, a fintech startup"
+  GLOSSARY             comma-separated names to keep spelled as-is (products, customers, tools)
+  SUMMARY_PROMPT_FILE  optional file replacing the built-in prompt; {language}, {org} and {glossary} are filled in
+  BOT_EMAILS           the bot's own calendar address(es), excluded from participants
   WORKSPACE_ID         optional — bind each finalized meeting to this shared workspace (covers meetings
                        started by pasting a link, which calendar-sync never planned)
 
@@ -40,7 +45,7 @@ plus the summary + transcript as ONE Google Doc in DRIVE_FOLDER_ID (written as t
 through the service account's domain-wide delegation, Drive scope; Hebrew paragraphs set right-to-left).
 Without Drive access the two are attached to the Slack message as .md files instead.
   DRIVE_FOLDER_ID      Google Drive folder for the meeting Docs (empty → .md attachments)
-  DRIVE_AS             Workspace user the Docs are created as (default shraga@uvi.io)
+  DRIVE_AS             Workspace user the Docs are created as (required with DRIVE_FOLDER_ID)
   GOOGLE_SA_KEY_FILE   service-account key with domain-wide delegation incl. .../auth/drive
 """
 from __future__ import annotations
@@ -80,47 +85,52 @@ REDIS = os.environ.get("VEXA_REDIS_CONTAINER", "vexa-v012-redis-1")
 BACKUP_DIR = os.path.expanduser(os.environ.get("BACKUP_DIR", "~/.local/state/uvi-meeting-finalizer-backups"))
 META_DIR = os.path.expanduser(os.environ.get("META_DIR", "~/.local/state/uvi-calendar-sync/meetings"))
 ROSTER_FILE = os.path.expanduser(os.environ.get("ROSTER_FILE", "~/.config/uvi/team_roster.json"))
-DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "he")
-LANG_RE = re.compile(r"(?:\[|\b(?:lang(?:uage)?\s*[:=]\s*))(en|he)\]?", re.IGNORECASE)
+DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "en").strip().lower()
+LANGUAGES = [c.strip().lower() for c in os.environ.get("LANGUAGES", "en,he").split(",") if c.strip()]
+LANG_RE = re.compile(r"(?:\[|\b(?:lang(?:uage)?\s*[:=]\s*))(" + "|".join(map(re.escape, LANGUAGES)) + r")\b\]?",
+                     re.IGNORECASE)
+ORG_CONTEXT = os.environ.get("ORG_CONTEXT", "a company").strip()
+GLOSSARY = os.environ.get("GLOSSARY", "").strip()
+SUMMARY_PROMPT_FILE = os.path.expanduser(os.environ.get("SUMMARY_PROMPT_FILE", ""))
+RTL_LANGUAGES = {"he", "ar", "fa", "ur", "yi", "ps", "sd", "ug"}
+LANGUAGE_NAMES = {"en": "English", "he": "Hebrew", "ar": "Arabic", "fr": "French", "de": "German", "es": "Spanish",
+                  "ru": "Russian", "pt": "Portuguese", "it": "Italian", "nl": "Dutch", "fa": "Persian"}
 WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "").strip()
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
-DRIVE_AS = os.environ.get("DRIVE_AS", "shraga@uvi.io")
+DRIVE_AS = os.environ.get("DRIVE_AS", "").strip()
 SA_KEY_FILE = os.path.expanduser(os.environ.get("GOOGLE_SA_KEY_FILE", ""))
-BOT_EMAILS = {e.strip().lower() for e in os.environ.get("BOT_EMAILS", "shraga@uvi.io").split(",") if e.strip()}
+BOT_EMAILS = {e.strip().lower() for e in os.environ.get("BOT_EMAILS", "").split(",") if e.strip()}
 
-SUMMARY_PROMPT = {
-    "he": """You are writing the summary of an internal meeting at an Israeli startup (Uvi, formerly Naboo).
-The text on stdin is an automatic Hebrew transcript (it has transcription errors; infer the intended
-meaning, never invent facts that aren't there). Speaker labels come from Google Meet; people in one room
-may share one label.
+SUMMARY_PROMPT = """You are writing the summary of an internal meeting at {org}.
+The text on stdin is an automatic {language} transcript of the recording (it has transcription errors;
+infer the intended meaning, never invent facts that aren't there). Speaker labels come from the meeting
+platform; people sharing one room may share one label.
 
-Output GitHub Markdown, in Hebrew. The FIRST line is exactly `TITLE: <a 3–8 word title for the meeting>`.
-Then these sections, omitting any that would be empty:
-## תקציר — 2–4 sentences.
-## החלטות — bullets.
-## משימות — bullets "- **<מי>:** <מה>" (owner if stated, otherwise "לא הוגדר").
-## שאלות פתוחות — bullets.
-Keep product/tech names in their usual English spelling (Uvi, Naboo, Shraga, graf, CSA, SQLite, …).
-No preamble. If the transcript is too short or garbled to summarize, write `TITLE:` and one line saying so.""",
-    "en": """You are writing the summary of an internal meeting at a startup (Uvi, formerly Naboo).
-The text on stdin is an automatic English transcript (it has transcription errors; infer the intended
-meaning, never invent facts that aren't there). Speaker labels come from Google Meet; people in one room
-may share one label.
-
-Output GitHub Markdown, in English. The FIRST line is exactly `TITLE: <a 3–8 word title for the meeting>`.
-Then these sections, omitting any that would be empty:
+Output GitHub Markdown, written in {language}. The FIRST line is exactly `TITLE: <a 3–8 word title>`.
+Then these four sections — headings written in {language} — omitting any that would be empty:
 ## Summary — 2–4 sentences.
 ## Decisions — bullets.
 ## Action items — bullets "- **<who>:** <what>" (owner if stated, otherwise "unassigned").
 ## Open questions — bullets.
-No preamble. If the transcript is too short or garbled to summarize, write `TITLE:` and one line saying so.""",
-}
-LABELS = {
-    "he": {"participants": "Participants", "open": "Open in Vexa", "min": "min", "transcript": "Transcript",
-           "doc_min": "דק׳", "doc_transcript": "תמלול"},
-    "en": {"participants": "Participants", "open": "Open in Vexa", "min": "min", "transcript": "Transcript",
-           "doc_min": "min", "doc_transcript": "Transcript"},
-}
+{glossary}No preamble. If the transcript is too short or garbled to summarize, write `TITLE:` and one line saying so."""
+
+
+def summary_prompt(language: str) -> str:
+    template = SUMMARY_PROMPT
+    if SUMMARY_PROMPT_FILE:
+        with open(SUMMARY_PROMPT_FILE) as f:
+            template = f.read()
+    glossary = (f"Keep these names in their usual spelling: {GLOSSARY}.\n" if GLOSSARY else "")
+    return template.format(language=LANGUAGE_NAMES.get(language, language), org=ORG_CONTEXT, glossary=glossary)
+
+
+# Slack-side words stay English (one left-to-right message); words inside the Doc follow its language.
+SLACK_LABELS = {"participants": "Participants", "open": "Open in Vexa", "min": "min"}
+DOC_LABELS = {"he": {"min": "דק׳", "transcript": "תמלול"}, "ar": {"min": "دقيقة", "transcript": "النص"}}
+
+
+def doc_labels(language: str) -> dict:
+    return DOC_LABELS.get(language, {"min": "min", "transcript": "Transcript"})
 
 _model = None
 
@@ -286,7 +296,7 @@ def as_text(lines: list[dict]) -> str:
 
 def summarize(transcript: str, language: str) -> tuple[str, str]:
     """→ (title Claude proposes, Markdown body)."""
-    prompt = SUMMARY_PROMPT.get(language, SUMMARY_PROMPT["en"])
+    prompt = summary_prompt(language)
     r = subprocess.run([CLAUDE, "-p", prompt, "--output-format", "text"], input=transcript,
                        capture_output=True, text=True, timeout=600)
     if r.returncode != 0 or not r.stdout.strip():
@@ -499,7 +509,7 @@ def upload_files(files: list[tuple[str, str, str]], comment: str) -> None:
 
 def post(meeting: dict, title: str, summary_md: str, lines: list[dict], minutes: int, engine: str,
          who: list[str], language: str) -> None:
-    lab = LABELS.get(language, LABELS["en"])
+    lab, dlab = SLACK_LABELS, doc_labels(language)
     started = parse(meeting.get("start_time"))
     when = started.astimezone().strftime("%d/%m/%Y %H:%M") if started else ""
     head = f":memo: *{title}* · {when} · {minutes} {lab['min']}"
@@ -510,14 +520,14 @@ def post(meeting: dict, title: str, summary_md: str, lines: list[dict], minutes:
         parts.append(f"<{UI}/meetings/{meeting['id']}|{lab['open']}>")
     comment_parts = parts
     plain_who = ", ".join(sorted({l["speaker"] for l in lines if l["speaker"] != "?"}))
-    meta_line = f"{when} · {minutes} {lab['doc_min']}" + (f" · {plain_who}" if plain_who else "")
+    meta_line = f"{when} · {minutes} {dlab['min']}" + (f" · {plain_who}" if plain_who else "")
     summary_doc = f"# {title}\n\n{meta_line}\n\n{summary_md}\n"
-    transcript_doc = f"# {lab['doc_transcript']} — {title}\n\n{meta_line} · {engine.split('/')[-1]}\n\n" + "\n\n".join(
+    transcript_doc = f"# {dlab['transcript']} — {title}\n\n{meta_line} · {engine.split('/')[-1]}\n\n" + "\n\n".join(
         line_md(l) for l in lines) + "\n"
     stamp = (started or datetime.now(timezone.utc)).astimezone().strftime("%Y-%m-%d")
-    if DRIVE_FOLDER_ID and SA_KEY_FILE:
+    if DRIVE_FOLDER_ID and SA_KEY_FILE and DRIVE_AS:
         try:
-            rtl = language == "he"
+            rtl = language in RTL_LANGUAGES
             body = md_to_html(summary_doc, rtl) + "<hr>" + md_to_html(transcript_doc.replace("\n\n", "\n"), rtl)
             link = drive_doc(f"{title} — {stamp}", body, rtl)
             slack("chat.postMessage", channel=SLACK_CHANNEL, unfurl_links=False, unfurl_media=False,

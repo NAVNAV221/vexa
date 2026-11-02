@@ -1,0 +1,18 @@
+# Template unit — the instance name is the Linux user that owns the checkout, the venv and the env file:
+#   sudo cp uvi/meeting-finalizer/uvi-meeting-finalizer@.service /etc/systemd/system/
+#   sudo systemctl enable --now uvi-meeting-finalizer@$USER
+[Unit]
+Description=Vexa after-meeting pass (%i): final transcript, Claude summary, Slack + Google Doc
+After=docker.service network-online.target
+
+[Service]
+User=%i
+WorkingDirectory=/home/%i/.local/share/uvi-finalizer
+EnvironmentFile=/home/%i/.config/uvi/finalizer.env
+ExecStart=/home/%i/.local/share/uvi-finalizer/venv/bin/python -u /home/%i/vexa/uvi/meeting-finalizer/finalize.py
+Nice=10
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

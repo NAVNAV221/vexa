@@ -13,9 +13,16 @@ summary, and posts one Slack message — title, date, length, participants as @m
 invitees via `team_roster.json` → Slack `users.lookupByEmail`, plus Meet speaker names), a link — with
 `summary-<date>.md` and `transcript-<date>.md` attached (right-to-left Hebrew reads badly inline).
 
-**Language:** Hebrew by default; a meeting is English when its title carries `[EN]` (calendar event
-title/description, or the title of a meeting planned in Vexa). It drives the transcription language
-and the summary language.
+**Language:** `DEFAULT_LANGUAGE` for untagged meetings; a tag in the title (`[EN]`, `[HE]`, `lang: ar`,
+… any code in `LANGUAGES`) picks another. It drives the transcription and summary language; right-to-left
+languages (Hebrew, Arabic, Persian, …) get right-to-left Docs.
+
+**Where it goes:** with `DRIVE_FOLDER_ID` + `DRIVE_AS` (a Workspace user the service account may
+impersonate with `.../auth/drive`), one Google Doc per meeting (summary + transcript) in that folder,
+linked from the Slack post; otherwise `summary-<date>.md` + `transcript-<date>.md` attached to it.
+
+**Your organization:** `ORG_CONTEXT` (one line about the company), `GLOSSARY` (names to keep spelled
+as-is) and optionally `SUMMARY_PROMPT_FILE` (a full prompt with `{language}`, `{org}`, `{glossary}`).
 
 It runs on the host (not in a container) so it uses — and keeps refreshed — the same Claude Code
 login the Vexa agent mounts.
@@ -25,11 +32,11 @@ login the Vexa agent mounts.
 ```bash
 sudo apt-get install -y ffmpeg python3-venv
 mkdir -p ~/.local/share/uvi-finalizer && python3 -m venv ~/.local/share/uvi-finalizer/venv
-~/.local/share/uvi-finalizer/venv/bin/pip install faster-whisper requests numpy
+~/.local/share/uvi-finalizer/venv/bin/pip install faster-whisper requests numpy google-auth
 # ~/.config/uvi/finalizer.env (mode 600): VEXA_API_BASE, VEXA_API_KEY, VEXA_UI_URL,
 #   SLACK_BOT_TOKEN, SLACK_CHANNEL (channel id), CLAUDE_BIN, FINAL_STT_KEY_FILE, WHISPER_THREADS — see finalize.py
 # ~/.config/uvi/team_roster.json: {email: {displayName, slackId}} (copy of skills-poc app/team_roster.json)
-sudo cp uvi/meeting-finalizer/uvi-meeting-finalizer.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now uvi-meeting-finalizer
-journalctl -u uvi-meeting-finalizer -f
+sudo cp uvi/meeting-finalizer/uvi-meeting-finalizer@.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now uvi-meeting-finalizer@$USER
+journalctl -u uvi-meeting-finalizer@$USER -f
 ```
