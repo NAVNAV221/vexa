@@ -36,10 +36,16 @@ Env:
                        started by pasting a link, which calendar-sync never planned)
 
 Slack post: one short message — title, date, length, participants as @mentions, a link to the meeting —
-with summary.md and transcript.md attached (Hebrew right-to-left text reads badly inline in Slack).
+plus the summary + transcript as ONE Google Doc in DRIVE_FOLDER_ID (written as the bot's Workspace user
+through the service account's domain-wide delegation, Drive scope; Hebrew paragraphs set right-to-left).
+Without Drive access the two are attached to the Slack message as .md files instead.
+  DRIVE_FOLDER_ID      Google Drive folder for the meeting Docs (empty → .md attachments)
+  DRIVE_AS             Workspace user the Docs are created as (default shraga@uvi.io)
+  GOOGLE_SA_KEY_FILE   service-account key with domain-wide delegation incl. .../auth/drive
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -77,6 +83,9 @@ ROSTER_FILE = os.path.expanduser(os.environ.get("ROSTER_FILE", "~/.config/uvi/te
 DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "he")
 LANG_RE = re.compile(r"(?:\[|\b(?:lang(?:uage)?\s*[:=]\s*))(en|he)\]?", re.IGNORECASE)
 WORKSPACE_ID = os.environ.get("WORKSPACE_ID", "").strip()
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
+DRIVE_AS = os.environ.get("DRIVE_AS", "shraga@uvi.io")
+SA_KEY_FILE = os.path.expanduser(os.environ.get("GOOGLE_SA_KEY_FILE", ""))
 BOT_EMAILS = {e.strip().lower() for e in os.environ.get("BOT_EMAILS", "shraga@uvi.io").split(",") if e.strip()}
 
 SUMMARY_PROMPT = {
@@ -421,6 +430,58 @@ def line_md(l: dict) -> str:
     return "**" + (stamp + " " + who).strip() + "** " + l["text"]
 
 
+def _inline_md(text: str) -> str:
+    out = html.escape(text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
+
+
+def md_to_html(md: str, rtl: bool) -> str:
+    """The small Markdown subset our summaries use (#/## headings, - bullets, **bold**) → HTML for Docs import."""
+    d = ' dir="rtl" style="direction:rtl;text-align:right"' if rtl else ""
+    parts, in_list = [], False
+    for line in md.splitlines():
+        t = line.strip()
+        if t.startswith(("- ", "* ", "• ")):
+            if not in_list:
+                parts.append(f"<ul{d}>"); in_list = True
+            parts.append(f"<li{d}>{_inline_md(t[2:])}</li>")
+            continue
+        if in_list:
+            parts.append("</ul>"); in_list = False
+        if not t:
+            continue
+        m = re.match(r"(#{1,3})\s+(.*)", t)
+        if m:
+            n = len(m.group(1))
+            parts.append(f"<h{n}{d}>{_inline_md(m.group(2))}</h{n}>")
+        else:
+            parts.append(f"<p{d}>{_inline_md(t)}</p>")
+    if in_list:
+        parts.append("</ul>")
+    return "".join(parts)
+
+
+def drive_doc(name: str, body_html: str, rtl: bool) -> str:
+    """Create a Google Doc (converted from HTML) in DRIVE_FOLDER_ID as DRIVE_AS → its web link."""
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request
+    creds = service_account.Credentials.from_service_account_file(
+        SA_KEY_FILE, scopes=["https://www.googleapis.com/auth/drive"], subject=DRIVE_AS)
+    creds.refresh(Request())
+    dir_attr = ' dir="rtl"' if rtl else ""
+    page = f'<html{dir_attr}><head><meta charset="utf-8"></head><body{dir_attr}>{body_html}</body></html>'
+    boundary = "uvi-finalizer-boundary"
+    meta = json.dumps({"name": name, "mimeType": "application/vnd.google-apps.document", "parents": [DRIVE_FOLDER_ID]})
+    payload = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n"
+               f"--{boundary}\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n{page}\r\n--{boundary}--").encode("utf-8")
+    r = requests.post("https://www.googleapis.com/upload/drive/v3/files",
+                      params={"uploadType": "multipart", "supportsAllDrives": "true", "fields": "id,webViewLink"},
+                      headers={"Authorization": f"Bearer {creds.token}", "Content-Type": f"multipart/related; boundary={boundary}"},
+                      data=payload, timeout=120)
+    r.raise_for_status()
+    return r.json()["webViewLink"]
+
+
 def upload_files(files: list[tuple[str, str, str]], comment: str) -> None:
     """files = [(filename, title, text)] → one Slack message carrying them, with `comment` as its text."""
     ids = []
@@ -445,15 +506,25 @@ def post(meeting: dict, title: str, summary_md: str, lines: list[dict], minutes:
         parts.append(f"{lab['participants']}: {' '.join(who)}")
     if UI:
         parts.append(f"<{UI}/meetings/{meeting['id']}|{lab['open']}>")
-    comment = "\n".join(parts)
+    comment_parts = parts
     plain_who = ", ".join(sorted({l["speaker"] for l in lines if l["speaker"] != "?"}))
     meta_line = f"{when} · {minutes} {lab['min']}" + (f" · {plain_who}" if plain_who else "")
     summary_doc = f"# {title}\n\n{meta_line}\n\n{summary_md}\n"
     transcript_doc = f"# {lab['transcript']} — {title}\n\n{meta_line} · {engine.split('/')[-1]}\n\n" + "\n\n".join(
         line_md(l) for l in lines) + "\n"
     stamp = (started or datetime.now(timezone.utc)).astimezone().strftime("%Y-%m-%d")
+    if DRIVE_FOLDER_ID and SA_KEY_FILE:
+        try:
+            rtl = language == "he"
+            body = md_to_html(summary_doc, rtl) + "<hr>" + md_to_html(transcript_doc.replace("\n\n", "\n"), rtl)
+            link = drive_doc(f"{title} — {stamp}", body, rtl)
+            slack("chat.postMessage", channel=SLACK_CHANNEL, unfurl_links=False, unfurl_media=False,
+                  text="\n".join(comment_parts + [f":page_facing_up: <{link}|Summary + transcript (Google Doc)>"]))
+            return
+        except Exception as e:
+            log.warning("Google Doc failed (%s) — attaching .md files instead", e)
     upload_files([(f"summary-{stamp}.md", f"Summary — {title}", summary_doc),
-                  (f"transcript-{stamp}.md", f"Transcript — {title}", transcript_doc)], comment)
+                  (f"transcript-{stamp}.md", f"Transcript — {title}", transcript_doc)], "\n".join(comment_parts))
 
 
 def process(meeting: dict, entry: dict) -> str:
