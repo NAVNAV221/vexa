@@ -2,7 +2,7 @@
 
 Vexa's live transcript is built from short per-speaker windows, which is weak for Hebrew. When a
 meeting completes, this job re-transcribes the **full recording** with `microsoft/mai-transcribe-2`
-through OpenRouter (10-minute mono Opus pieces; seconds per meeting, ~$0.10/hour of audio) — the
+through OpenRouter (10-minute mono MP3 pieces; seconds per meeting, ~$0.10/hour of audio) — the
 best of a Hebrew bake-off of OpenRouter's transcription models — falling back to a local ivrit.ai
 Whisper model (faster-whisper, int8 CPU, ~1.5× the meeting length) if the API fails. It replaces
 Vexa's live transcript with the final one (live copy backed up), labels speakers from

@@ -2,7 +2,7 @@
 
 Vexa's live transcript is built from short per-speaker windows. Once a meeting completes, this job
 re-transcribes the whole recording — through an OpenAI-compatible transcription API (default:
-OpenRouter's microsoft/mai-transcribe-2, sent as 10-minute mono Opus pieces), falling back to a
+OpenRouter's microsoft/mai-transcribe-2, sent as 10-minute mono MP3 pieces), falling back to a
 local ivrit.ai Whisper model (faster-whisper, CPU) if the API fails — attributes speakers from Vexa's live segments by time overlap, asks the
 `claude` CLI (the host's Claude Code login) for a Hebrew summary, and posts it to a Slack channel
 with the full transcript attached in the thread.
@@ -130,28 +130,33 @@ def to_wav(src: str, dst: str) -> np.ndarray:
 
 
 def speaker_at(live: list[dict], t0: float, t1: float) -> str:
+    """Speaker of the live segment overlapping [t0, t1] most; else the nearest one within 5 s."""
     best, best_ov = "", 0.0
+    near, near_gap = "", 5.0
     for s in live:
         ov = min(t1, s["end"]) - max(t0, s["start"])
         if ov > best_ov:
             best, best_ov = s.get("speaker") or "", ov
-    return best
+        elif ov <= 0 and -ov < near_gap and s.get("speaker"):
+            near, near_gap = s["speaker"], -ov
+    return best or near
 
 
 def api_segments(src: str, workdir: str) -> list[tuple[float, float, str]]:
-    """Full recording → (start, end, text) via the transcription API, in CHUNK_S mono-Opus pieces."""
+    """Full recording → (start, end, text) via the transcription API, in CHUNK_S mono MP3 pieces
+    (MAI-Transcribe 2 rejects Opus re-encoded from the recording's WebM; MP3 is accepted)."""
     with open(STT_KEY_FILE) as f:
         key = f.read().strip()
-    parts = os.path.join(workdir, "part%03d.ogg")
+    parts = os.path.join(workdir, "part%03d.mp3")
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-ac", "1", "-ar", "16000",
-                    "-c:a", "libopus", "-b:a", "32k", "-f", "segment", "-segment_time", str(CHUNK_S), parts], check=True)
+                    "-c:a", "libmp3lame", "-b:a", "48k", "-f", "segment", "-segment_time", str(CHUNK_S), parts], check=True)
     out: list[tuple[float, float, str]] = []
-    for i, name in enumerate(sorted(n for n in os.listdir(workdir) if n.startswith("part") and n.endswith(".ogg"))):
+    for i, name in enumerate(sorted(n for n in os.listdir(workdir) if n.startswith("part") and n.endswith(".mp3"))):
         for attempt in range(5):
             with open(os.path.join(workdir, name), "rb") as f:
                 r = requests.post(STT_URL, headers={"Authorization": f"Bearer {key}"}, timeout=600,
                                   data={"model": STT_MODEL, "language": "he", "response_format": "verbose_json"},
-                                  files={"file": (name, f, "audio/ogg")})
+                                  files={"file": (name, f, "audio/mpeg")})
             if r.status_code in (429, 500, 502, 503, 504) and attempt < 4:
                 time.sleep(5 * (attempt + 1) ** 2)
                 continue
