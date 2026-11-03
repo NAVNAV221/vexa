@@ -311,10 +311,13 @@ def summarize(transcript: str, language: str) -> tuple[str, str]:
 # --- meeting context: language, title, participants -------------------------------------------
 
 def meeting_meta(code: str) -> dict:
+    """calendar-sync's sidecar for this meeting; missing/unreadable → {} (a summary never waits on it)."""
     try:
         with open(os.path.join(META_DIR, f"{code}.json")) as f:
             return json.load(f)
-    except (FileNotFoundError, ValueError):
+    except (OSError, ValueError) as e:
+        if not isinstance(e, FileNotFoundError):
+            log.warning("meeting meta for %s unreadable (%s) — continuing without invitees/title", code, e)
         return {}
 
 

@@ -90,6 +90,7 @@ def write_meta(code: str, ev: dict) -> None:
     with open(tmp, "w") as f:
         json.dump({"title": ev["title"], "start": iso(ev["start"]), "end": iso(ev["end"]) if ev["end"] else None,
                    "attendees": ev["attendees"], "language": ev["language"]}, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, 0o644)  # read by the after-meeting job, which runs as another user
     os.replace(tmp, path)
 
 _creds = service_account.Credentials.from_service_account_file(
