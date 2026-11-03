@@ -268,6 +268,17 @@ def local_segments(src: str, workdir: str, language: str) -> list[tuple[float, f
     return [(s.start, s.end, s.text, None) for s in segs]
 
 
+def live_segments(meeting: dict) -> list[dict]:
+    """The bot's LIVE segments (Meet speaker names). Once this job has replaced them with the final
+    transcript, Vexa only holds the final one — so a re-run reads the live copy backed up at that point."""
+    backup = os.path.join(BACKUP_DIR, f"meeting-{int(meeting['id'])}-live.json")
+    if os.path.exists(backup):
+        with open(backup) as f:
+            rows = json.load(f) or []
+        return [{"start": float(r["start_time"]), "end": float(r["end_time"]), "speaker": r.get("speaker")} for r in rows]
+    return vexa(f"/transcripts/google_meet/{meeting['native_meeting_id']}").json().get("segments", [])
+
+
 def name_voices(segs: list[tuple], live: list[dict], rec_start: float) -> dict:
     """Diarized voice → display name. Each voice takes the Meet participant it overlaps most; when several
     voices share one participant (people around one device) they become "<name> · voice N"."""
@@ -317,7 +328,7 @@ def transcribe(meeting: dict, rec: dict, workdir: str, language: str) -> tuple[l
         engine = MODEL
         segs = local_segments(src, workdir, language)
 
-    live = vexa(f"/transcripts/google_meet/{meeting['native_meeting_id']}").json().get("segments", [])
+    live = live_segments(meeting)
     rec_start = (parse(rec.get("created_at")) or parse(meeting.get("start_time"))).timestamp()
     out: list[dict] = []
     voice_names = name_voices(segs, live, rec_start)
@@ -440,7 +451,7 @@ def participants(meta: dict, live: list[dict]) -> list[str]:
         tag = f"<@{sid}>" if sid else email
         if tag not in seen:
             seen.add(tag); out.append(tag)
-    for name in sorted({s.get("speaker") for s in live if s.get("speaker")}):
+    for name in sorted({s["speaker"].split(" · voice ")[0] for s in live if s.get("speaker")}):
         sid = slack_id_for_name(name)
         tag = f"<@{sid}>" if sid else name
         if tag not in seen:
