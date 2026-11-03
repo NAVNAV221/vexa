@@ -197,6 +197,11 @@ def vexa_meetings() -> dict[str, dict]:
     return by_code
 
 
+def planned_at(m: dict) -> datetime | None:
+    """A Vexa meeting record keeps its planned start in data.scheduled_at."""
+    return parse(m.get("scheduled_at") or (m.get("data") or {}).get("scheduled_at"))
+
+
 def sync_once(state: dict[str, int]) -> None:
     wanted = wanted_events()
     existing = vexa_meetings()
@@ -212,13 +217,13 @@ def sync_once(state: dict[str, int]) -> None:
         if cur and cur.get("status") not in PLANNED and cur.get("status") not in {"completed", "failed"}:
             continue  # a bot is live on this link right now
         if cur and cur.get("status") in {"completed", "failed"}:
-            began = parse(cur.get("scheduled_at")) or parse(cur.get("start_time")) or parse(cur.get("created_at"))
+            began = planned_at(cur) or parse(cur.get("start_time")) or parse(cur.get("created_at"))
             if began and abs((began - ev["start"]).total_seconds()) < 3 * 3600:
                 continue  # this occurrence already happened (or failed) — don't re-join it
         if cur and cur.get("status") in PLANNED:
             if state.get(code) != cur["id"]:
                 continue  # someone planned it by hand — theirs, not ours
-            have = parse(cur.get("scheduled_at"))
+            have = planned_at(cur)
             if have is None or abs((have - ev["start"]).total_seconds()) > 30:
                 r = requests.patch(f"{VEXA}/meetings/{cur['id']}", headers=VEXA_HEADERS,
                                    json={"scheduled_at": iso(ev["start"]), "auto_join": True}, timeout=20)

@@ -18,7 +18,9 @@ Env:
   FINAL_STT_URL        default https://openrouter.ai/api/v1/audio/transcriptions
   FINAL_STT_MODEL      default elevenlabs/scribe-v2 (empty → local ivrit.ai only)
   FINAL_STT_KEY_FILE   file holding the API key for FINAL_STT_URL
-  FINAL_STT_CHUNK_S    default 3600 (voice labels from diarization restart in every piece)
+  FINAL_STT_CHUNK_S    default 600 — piece length; the provider times out (HTTP 524 inside a 200 body) on
+                       pieces much over 15 min. Voice labels from diarization restart in every piece
+  FINAL_STT_PARALLEL   default 3 — pieces transcribed at once
   FINAL_STT_DIARIZE    default true — separate speakers by voice; several people on one Meet device become
                        "<name> · voice N" instead of all being labelled with that device's account
   DIARIZE_MAX_SPEAKERS default 6
@@ -62,6 +64,7 @@ import subprocess
 import tempfile
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import numpy as np
@@ -78,13 +81,16 @@ MODEL = os.environ.get("WHISPER_MODEL", "ivrit-ai/whisper-large-v3-turbo-ct2")
 STT_URL = os.environ.get("FINAL_STT_URL", "https://openrouter.ai/api/v1/audio/transcriptions")
 STT_MODEL = os.environ.get("FINAL_STT_MODEL", "elevenlabs/scribe-v2")
 STT_KEY_FILE = os.path.expanduser(os.environ.get("FINAL_STT_KEY_FILE", ""))
-CHUNK_S = int(os.environ.get("FINAL_STT_CHUNK_S", "3600"))
+CHUNK_S = int(os.environ.get("FINAL_STT_CHUNK_S", "600"))
+STT_PARALLEL = max(1, int(os.environ.get("FINAL_STT_PARALLEL", "3")))
+RETRYABLE = {408, 409, 429, 500, 502, 503, 504, 520, 522, 524, 529}
 DIARIZE = os.environ.get("FINAL_STT_DIARIZE", "true").strip().lower() in ("1", "true", "yes", "on")
 MAX_SPEAKERS = int(os.environ.get("DIARIZE_MAX_SPEAKERS", "6"))
 THREADS = int(os.environ.get("WHISPER_THREADS", "2"))
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 STATE_FILE = os.path.expanduser(os.environ.get("STATE_FILE", "~/.local/state/uvi-meeting-finalizer.json"))
 POLL_S = float(os.environ.get("POLL_S", "60"))
+MAX_ATTEMPTS = 3  # the last one may fall back to the local model
 PG = os.environ.get("VEXA_PG_CONTAINER", "vexa-v012-postgres-1")
 REDIS = os.environ.get("VEXA_REDIS_CONTAINER", "vexa-v012-redis-1")
 BACKUP_DIR = os.path.expanduser(os.environ.get("BACKUP_DIR", "~/.local/state/uvi-meeting-finalizer-backups"))
@@ -227,29 +233,47 @@ def words_to_segments(words: list[dict], off: float, piece: int = 0) -> list[tup
     return out
 
 
+def stt_piece(path: str, key: str, language: str) -> dict:
+    """One audio piece → the provider's verbose_json. OpenRouter reports a provider failure either as an HTTP
+    error or as HTTP 200 with {"error": {"code": …}} — both raise; timeouts and 5xx are retried with backoff."""
+    last = ""
+    for attempt in range(5):
+        if attempt:
+            time.sleep(5 * attempt ** 2)
+        with open(path, "rb") as f:
+            try:
+                r = requests.post(STT_URL, headers={"Authorization": f"Bearer {key}"}, timeout=600,
+                                  data={"model": STT_MODEL, "language": language, "response_format": "verbose_json",
+                                        "timestamp_granularities[]": "word",
+                                        **({"diarize": "true", "num_speakers": str(MAX_SPEAKERS)} if DIARIZE else {})},
+                                  files={"file": (os.path.basename(path), f, "audio/mpeg")})
+            except requests.RequestException as e:
+                last = str(e)
+                continue
+        body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        err = body.get("error") if isinstance(body, dict) else None
+        code = int((err or {}).get("code") or 0) if isinstance(err, dict) else 0
+        if r.ok and not err:
+            return body
+        last = f"HTTP {r.status_code}: {(err or {}).get('message') if isinstance(err, dict) else r.text[:200]} (code {code or r.status_code})"
+        if r.status_code not in RETRYABLE and code not in RETRYABLE:
+            break
+    raise RuntimeError(f"{STT_MODEL} on {os.path.basename(path)}: {last}")
+
+
 def api_segments(src: str, workdir: str, language: str) -> list[tuple[float, float, str]]:
-    """Full recording → (start, end, text) via the transcription API, in CHUNK_S mono MP3 pieces
-    (MAI-Transcribe 2 rejects Opus re-encoded from the recording's WebM; MP3 is accepted)."""
+    """Full recording → (start, end, text, voice) via the transcription API, in CHUNK_S mono MP3 pieces sent
+    STT_PARALLEL at a time (MAI-Transcribe 2 rejects Opus re-encoded from the recording's WebM; MP3 is accepted)."""
     with open(STT_KEY_FILE) as f:
         key = f.read().strip()
     parts = os.path.join(workdir, "part%03d.mp3")
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-ac", "1", "-ar", "16000",
                     "-c:a", "libmp3lame", "-b:a", "48k", "-f", "segment", "-segment_time", str(CHUNK_S), parts], check=True)
+    names = sorted(n for n in os.listdir(workdir) if n.startswith("part") and n.endswith(".mp3"))
+    with ThreadPoolExecutor(STT_PARALLEL) as pool:
+        bodies = list(pool.map(lambda n: stt_piece(os.path.join(workdir, n), key, language), names))
     out: list[tuple[float, float, str]] = []
-    for i, name in enumerate(sorted(n for n in os.listdir(workdir) if n.startswith("part") and n.endswith(".mp3"))):
-        for attempt in range(5):
-            with open(os.path.join(workdir, name), "rb") as f:
-                r = requests.post(STT_URL, headers={"Authorization": f"Bearer {key}"}, timeout=600,
-                                  data={"model": STT_MODEL, "language": language, "response_format": "verbose_json",
-                                        "timestamp_granularities[]": "word",
-                                        **({"diarize": "true", "num_speakers": str(MAX_SPEAKERS)} if DIARIZE else {})},
-                                  files={"file": (name, f, "audio/mpeg")})
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < 4:
-                time.sleep(5 * (attempt + 1) ** 2)
-                continue
-            r.raise_for_status()
-            break
-        body = r.json()
+    for i, body in enumerate(bodies):
         off = i * CHUNK_S
         segs = body.get("segments") or []
         words = [w for w in (body.get("words") or []) if w.get("word", "").strip() and "start" in w]
@@ -310,7 +334,8 @@ def name_voices(segs: list[tuple], live: list[dict], rec_start: float) -> dict:
     return names
 
 
-def transcribe(meeting: dict, rec: dict, workdir: str, language: str) -> tuple[list[dict], str, list[dict]]:
+def transcribe(meeting: dict, rec: dict, workdir: str, language: str, local_fallback: bool = True
+               ) -> tuple[list[dict], str, list[dict]]:
     src = os.path.join(workdir, "audio.webm")
     with requests.get(f"{VEXA}/recordings/{rec['id']}/media/{rec['media']}/download", headers=VH, stream=True, timeout=120) as r:
         r.raise_for_status()
@@ -323,6 +348,8 @@ def transcribe(meeting: dict, rec: dict, workdir: str, language: str) -> tuple[l
         try:
             segs = api_segments(src, workdir, language)
         except Exception as e:
+            if not local_fallback:
+                raise
             log.warning("meeting %s: %s failed (%s) — falling back to %s", meeting["id"], STT_MODEL, e, MODEL)
     if segs is None:
         engine = MODEL
@@ -467,6 +494,24 @@ def slack(method: str, **payload) -> dict:
     return d
 
 
+def status_post(entry: dict, text: str) -> None:
+    """The meeting's one status message in the channel: posted when processing starts, edited as it goes,
+    and replaced by the summary post at the end — people see that a transcript is on its way."""
+    try:
+        if entry.get("status_ts"):
+            slack("chat.update", channel=SLACK_CHANNEL, ts=entry["status_ts"], text=text)
+        else:
+            entry["status_ts"] = slack("chat.postMessage", channel=SLACK_CHANNEL, text=text)["ts"]
+    except Exception as e:
+        log.warning("status message failed: %s", e)
+
+
+def meeting_label(meeting: dict, title: str) -> str:
+    a, b = parse(meeting.get("start_time")), parse(meeting.get("end_time"))
+    minutes = max(1, round((b - a).total_seconds() / 60)) if a and b else 0
+    return f"*{title}*" + (f" ({minutes} min)" if minutes else "")
+
+
 def psql(sql: str) -> str:
     r = subprocess.run(["docker", "exec", "-i", PG, "psql", "-U", "postgres", "-d", "vexa", "-v", "ON_ERROR_STOP=1", "-At"],
                        input=sql, capture_output=True, text=True, timeout=120)
@@ -568,7 +613,7 @@ def upload_files(files: list[tuple[str, str, str]], comment: str) -> None:
 
 
 def post(meeting: dict, title: str, summary_md: str, lines: list[dict], minutes: int, engine: str,
-         who: list[str], language: str) -> None:
+         who: list[str], language: str, status_ts: str | None = None) -> None:
     lab, dlab = SLACK_LABELS, doc_labels(language)
     started = parse(meeting.get("start_time"))
     when = started.astimezone().strftime("%d/%m/%Y %H:%M") if started else ""
@@ -590,13 +635,21 @@ def post(meeting: dict, title: str, summary_md: str, lines: list[dict], minutes:
             rtl = language in RTL_LANGUAGES
             body = md_to_html(summary_doc, rtl) + "<hr>" + md_to_html(transcript_doc.replace("\n\n", "\n"), rtl)
             link = drive_doc(f"{title} — {stamp}", body, rtl)
-            slack("chat.postMessage", channel=SLACK_CHANNEL, unfurl_links=False, unfurl_media=False,
-                  text="\n".join(comment_parts + [f":page_facing_up: <{link}|Summary + transcript (Google Doc)>"]))
+            text = "\n".join(comment_parts + [f":page_facing_up: <{link}|Summary + transcript (Google Doc)>"])
+            if status_ts:
+                slack("chat.update", channel=SLACK_CHANNEL, ts=status_ts, text=text)
+            else:
+                slack("chat.postMessage", channel=SLACK_CHANNEL, unfurl_links=False, unfurl_media=False, text=text)
             return
         except Exception as e:
             log.warning("Google Doc failed (%s) — attaching .md files instead", e)
     upload_files([(f"summary-{stamp}.md", f"Summary — {title}", summary_doc),
                   (f"transcript-{stamp}.md", f"Transcript — {title}", transcript_doc)], "\n".join(comment_parts))
+    if status_ts:
+        try:
+            slack("chat.delete", channel=SLACK_CHANNEL, ts=status_ts)
+        except Exception as e:
+            log.warning("could not remove the status message: %s", e)
 
 
 def process(meeting: dict, entry: dict) -> str:
@@ -606,11 +659,20 @@ def process(meeting: dict, entry: dict) -> str:
     meta = meeting_meta(meeting["native_meeting_id"])
     raw_title = (meeting.get("data") or {}).get("title") or meeting.get("title") or meta.get("title") or ""
     language = meeting_language(raw_title, meta)
+    if entry.get("status") != "posted":
+        entry["label"] = meeting_label(meeting, clean_title(raw_title) or "Meeting")
+        if not entry.get("status_ts"):
+            status_post(entry, f":hourglass_flowing_sand: {entry['label']} ended — writing the transcript and "
+                               f"summary; they'll be here in a few minutes.")
     with tempfile.TemporaryDirectory() as wd:
         t = time.time()
-        lines, engine, live = transcribe(meeting, rec, wd, language)
+        lines, engine, live = transcribe(meeting, rec, wd, language, local_fallback=entry.get("attempts", 0) >= MAX_ATTEMPTS - 1)
         log.info("meeting %s: transcribed %d lines in %.0fs with %s (%s)", meeting["id"], len(lines), time.time() - t, engine, language)
     if not lines:
+        spoken = sum(1 for s in live if (s.get("text") or "").strip())
+        if spoken:
+            raise RuntimeError(f"final transcript came back empty while the live one has {spoken} segments")
+        status_post(entry, f":mute: {entry.get('label', 'The meeting')} — no speech in the recording, nothing to summarize.")
         return "empty"
     if WORKSPACE_ID and not meeting.get("workspace_id"):
         requests.post(f"{VEXA}/meetings/google_meet/{meeting['native_meeting_id']}/workspace", headers=VH,
@@ -624,7 +686,7 @@ def process(meeting: dict, entry: dict) -> str:
     proposed, summary = summarize(as_text(lines), language)
     title = clean_title(raw_title) or proposed or meeting["native_meeting_id"]
     minutes = max(1, round(lines[-1]["end"] / 60))
-    post(meeting, title, summary, lines, minutes, engine, participants(meta, live), language)
+    post(meeting, title, summary, lines, minutes, engine, participants(meta, live), language, entry.get("status_ts"))
     log.info("meeting %s: posted to Slack", meeting["id"])
     return "posted"
 
@@ -646,7 +708,7 @@ def main() -> None:
                 entry = state.get(key) or {}
                 if isinstance(entry, str):  # first-version state: a bare status string
                     entry = {"status": entry}
-                if (entry.get("status") in ("posted", "empty") and entry.get("written", entry.get("status") == "empty")) or entry.get("attempts", 0) >= 3:
+                if (entry.get("status") in ("posted", "empty") and entry.get("written", entry.get("status") == "empty")) or entry.get("attempts", 0) >= MAX_ATTEMPTS:
                     continue
                 if entry.get("status") == "waiting-for-recording" and (datetime.now(timezone.utc) - ended).total_seconds() > 3600:
                     continue  # no recording an hour after the end — give up quietly
@@ -656,6 +718,13 @@ def main() -> None:
                     log.error("meeting %s failed: %s", key, e)
                     entry["status"] = f"error: {e}"[:200]
                     entry["attempts"] = entry.get("attempts", 0) + 1
+                    label = entry.get("label", "The meeting")
+                    if entry["attempts"] < MAX_ATTEMPTS:
+                        status_post(entry, f":hourglass_flowing_sand: {label} — the transcript hit an error, "
+                                           f"retrying ({entry['attempts']}/{MAX_ATTEMPTS}).")
+                    else:
+                        status_post(entry, f":warning: {label} — couldn't produce the transcript "
+                                           f"(`{str(e)[:150]}`). The recording is kept; ask Shraga here to retry it.")
                 state[key] = entry
                 save_state(state)
         except Exception as e:

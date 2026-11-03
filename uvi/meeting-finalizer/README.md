@@ -28,6 +28,25 @@ as-is) and optionally `SUMMARY_PROMPT_FILE` (a full prompt with `{language}`, `{
 It runs on the host (not in a container) so it uses — and keeps refreshed — the same Claude Code
 login the Vexa agent mounts.
 
+**In the channel:** when a meeting ends it posts a status line right away (":hourglass_flowing_sand: *Title*
+(37 min) ended — writing the transcript and summary"), edits it on a retry or a failure, and replaces it
+with the summary post at the end. Transcription errors are never read as "no speech": OpenRouter can
+answer HTTP 200 with `{"error": {"code": 524}}` (provider timeout) — that is retried, pieces stay at
+10 minutes (`FINAL_STT_CHUNK_S`; a 37-minute piece timed out) and go `FINAL_STT_PARALLEL` at a time,
+and a meeting whose live transcript has speech but whose final one came back empty is an error, not
+"empty". Three attempts per meeting; only the last may fall back to the local model.
+
+## Operating it — `meetingctl.py`
+
+```bash
+sudo python3 ~OWNER/vexa/uvi/meeting-finalizer/meetingctl.py list               # recent meetings + finalizer state
+sudo python3 ~OWNER/vexa/uvi/meeting-finalizer/meetingctl.py status jxs-mnre-xyj # one meeting, end to end
+sudo python3 ~OWNER/vexa/uvi/meeting-finalizer/meetingctl.py reprocess 10        # run the pass again
+```
+
+Stdlib only (no venv), reads the owner's `finalizer.env`; `reprocess` stops the service, clears the
+meeting's state entry and starts it again (refuses a meeting already posted unless `--force`).
+
 ## Install (Ubuntu host)
 
 ```bash
