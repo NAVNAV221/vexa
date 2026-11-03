@@ -18,7 +18,10 @@ Env:
   FINAL_STT_URL        default https://openrouter.ai/api/v1/audio/transcriptions
   FINAL_STT_MODEL      default elevenlabs/scribe-v2 (empty → local ivrit.ai only)
   FINAL_STT_KEY_FILE   file holding the API key for FINAL_STT_URL
-  FINAL_STT_CHUNK_S    default 600
+  FINAL_STT_CHUNK_S    default 3600 (voice labels from diarization restart in every piece)
+  FINAL_STT_DIARIZE    default true — separate speakers by voice; several people on one Meet device become
+                       "<name> · voice N" instead of all being labelled with that device's account
+  DIARIZE_MAX_SPEAKERS default 6
   WHISPER_MODEL        fallback, default ivrit-ai/whisper-large-v3-turbo-ct2
   WHISPER_THREADS      default 2 (leave room for live bots)
   CLAUDE_BIN           default claude
@@ -75,7 +78,9 @@ MODEL = os.environ.get("WHISPER_MODEL", "ivrit-ai/whisper-large-v3-turbo-ct2")
 STT_URL = os.environ.get("FINAL_STT_URL", "https://openrouter.ai/api/v1/audio/transcriptions")
 STT_MODEL = os.environ.get("FINAL_STT_MODEL", "elevenlabs/scribe-v2")
 STT_KEY_FILE = os.path.expanduser(os.environ.get("FINAL_STT_KEY_FILE", ""))
-CHUNK_S = int(os.environ.get("FINAL_STT_CHUNK_S", "600"))
+CHUNK_S = int(os.environ.get("FINAL_STT_CHUNK_S", "3600"))
+DIARIZE = os.environ.get("FINAL_STT_DIARIZE", "true").strip().lower() in ("1", "true", "yes", "on")
+MAX_SPEAKERS = int(os.environ.get("DIARIZE_MAX_SPEAKERS", "6"))
 THREADS = int(os.environ.get("WHISPER_THREADS", "2"))
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 STATE_FILE = os.path.expanduser(os.environ.get("STATE_FILE", "~/.local/state/uvi-meeting-finalizer.json"))
@@ -104,7 +109,8 @@ BOT_EMAILS = {e.strip().lower() for e in os.environ.get("BOT_EMAILS", "").split(
 SUMMARY_PROMPT = """You are writing the summary of an internal meeting at {org}.
 The text on stdin is an automatic {language} transcript of the recording (it has transcription errors;
 infer the intended meaning, never invent facts that aren't there). Speaker labels come from the meeting
-platform; people sharing one room may share one label.
+platform; labels like "Dana Cohen · voice 2" are DIFFERENT people sharing Dana's device in one room — if the
+conversation shows who they are (someone addresses them by name), use that name in the summary.
 
 Output GitHub Markdown, written in {language}. The FIRST line is exactly `TITLE: <a 3–8 word title>`.
 Then these four sections — headings written in {language} — omitting any that would be empty:
@@ -197,20 +203,27 @@ def speaker_at(live: list[dict], t0: float, t1: float) -> str:
     return best or near
 
 
-def words_to_segments(words: list[dict], off: float) -> list[tuple[float, float, str]]:
-    """Group word timestamps into sentence-like segments: break on end punctuation, a pause > 0.8 s, or 15 s."""
-    out: list[tuple[float, float, str]] = []
+def words_to_segments(words: list[dict], off: float, piece: int = 0) -> list[tuple]:
+    """Group word timestamps into sentence-like segments: break on end punctuation, a pause > 0.8 s, 15 s,
+    or a change of diarized speaker. → (start, end, text, voice) with voice = "<piece>:<speaker>" or None."""
+    out: list[tuple] = []
     cur: list[dict] = []
+
+    def voice_of(w: dict):
+        v = w.get("speaker", w.get("speaker_id"))
+        return None if v is None else f"{piece}:{v}"
+
+    def flush():
+        out.append((off + cur[0]["start"], off + cur[-1]["end"], " ".join(x["word"].strip() for x in cur), voice_of(cur[0])))
+
     for w in words:
-        if cur and (w["start"] - cur[-1]["end"] > 0.8 or w["end"] - cur[0]["start"] > 15):
-            out.append((off + cur[0]["start"], off + cur[-1]["end"], " ".join(x["word"].strip() for x in cur)))
-            cur = []
+        if cur and (w["start"] - cur[-1]["end"] > 0.8 or w["end"] - cur[0]["start"] > 15 or voice_of(w) != voice_of(cur[0])):
+            flush(); cur = []
         cur.append(w)
         if w["word"].rstrip().endswith((".", "?", "!")):
-            out.append((off + cur[0]["start"], off + cur[-1]["end"], " ".join(x["word"].strip() for x in cur)))
-            cur = []
+            flush(); cur = []
     if cur:
-        out.append((off + cur[0]["start"], off + cur[-1]["end"], " ".join(x["word"].strip() for x in cur)))
+        flush()
     return out
 
 
@@ -228,7 +241,8 @@ def api_segments(src: str, workdir: str, language: str) -> list[tuple[float, flo
             with open(os.path.join(workdir, name), "rb") as f:
                 r = requests.post(STT_URL, headers={"Authorization": f"Bearer {key}"}, timeout=600,
                                   data={"model": STT_MODEL, "language": language, "response_format": "verbose_json",
-                                        "timestamp_granularities[]": "word"},
+                                        "timestamp_granularities[]": "word",
+                                        **({"diarize": "true", "num_speakers": str(MAX_SPEAKERS)} if DIARIZE else {})},
                                   files={"file": (name, f, "audio/mpeg")})
             if r.status_code in (429, 500, 502, 503, 504) and attempt < 4:
                 time.sleep(5 * (attempt + 1) ** 2)
@@ -239,19 +253,50 @@ def api_segments(src: str, workdir: str, language: str) -> list[tuple[float, flo
         off = i * CHUNK_S
         segs = body.get("segments") or []
         words = [w for w in (body.get("words") or []) if w.get("word", "").strip() and "start" in w]
-        if words and len(segs) <= 1:  # e.g. Scribe: one segment per piece, but word timings
-            out += words_to_segments(words, off)
+        if words and (len(segs) <= 1 or DIARIZE):  # Scribe: word timings (+ speaker per word when diarized)
+            out += words_to_segments(words, off, i)
         elif segs:
-            out += [(off + float(s["start"]), off + float(s["end"]), s.get("text", "")) for s in segs]
+            out += [(off + float(s["start"]), off + float(s["end"]), s.get("text", ""), None) for s in segs]
         elif body.get("text"):
-            out.append((off, off + CHUNK_S, body["text"]))
+            out.append((off, off + CHUNK_S, body["text"], None))
     return out
 
 
 def local_segments(src: str, workdir: str, language: str) -> list[tuple[float, float, str]]:
     audio = to_wav(src, os.path.join(workdir, "audio.wav"))
     segs, _ = whisper().transcribe(audio, language=language, vad_filter=True, beam_size=5, condition_on_previous_text=False)
-    return [(s.start, s.end, s.text) for s in segs]
+    return [(s.start, s.end, s.text, None) for s in segs]
+
+
+def name_voices(segs: list[tuple], live: list[dict], rec_start: float) -> dict:
+    """Diarized voice → display name. Each voice takes the Meet participant it overlaps most; when several
+    voices share one participant (people around one device) they become "<name> · voice N"."""
+    overlap: dict = {}
+    for start, end, _text, voice in segs:
+        if voice is None:
+            continue
+        a, b = rec_start + start, rec_start + end
+        for s in live:
+            ov = min(b, s["end"]) - max(a, s["start"])
+            if ov > 0 and s.get("speaker"):
+                overlap.setdefault(voice, {}).setdefault(s["speaker"], 0.0)
+                overlap[voice][s["speaker"]] += ov
+    voices = sorted({v for *_x, v in segs if v is not None}, key=lambda v: (int(v.split(":")[0]), v))
+    owner = {v: (max(overlap[v], key=overlap[v].get) if overlap.get(v) else None) for v in voices}
+    names: dict = {}
+    counter: dict = {}
+    for v in voices:
+        base = owner[v]
+        shared = base is not None and sum(1 for o in owner.values() if o == base) > 1
+        if base is None:
+            counter["?"] = counter.get("?", 0) + 1
+            names[v] = f"Speaker {counter['?']}"
+        elif shared:
+            counter[base] = counter.get(base, 0) + 1
+            names[v] = f"{base} · voice {counter[base]}"
+        else:
+            names[v] = base
+    return names
 
 
 def transcribe(meeting: dict, rec: dict, workdir: str, language: str) -> tuple[list[dict], str, list[dict]]:
@@ -275,11 +320,12 @@ def transcribe(meeting: dict, rec: dict, workdir: str, language: str) -> tuple[l
     live = vexa(f"/transcripts/google_meet/{meeting['native_meeting_id']}").json().get("segments", [])
     rec_start = (parse(rec.get("created_at")) or parse(meeting.get("start_time"))).timestamp()
     out: list[dict] = []
-    for start, end, raw in segs:
+    voice_names = name_voices(segs, live, rec_start)
+    for start, end, raw, voice in segs:
         text = (raw or "").strip()
         if not text:
             continue
-        spk = speaker_at(live, rec_start + start, rec_start + end) or "?"
+        spk = voice_names.get(voice) or speaker_at(live, rec_start + start, rec_start + end) or "?"
         if out and out[-1]["speaker"] == spk and start - out[-1]["end"] < 2.0:
             out[-1]["text"] += " " + text
             out[-1]["end"] = end

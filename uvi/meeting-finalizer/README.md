@@ -5,7 +5,8 @@ meeting completes, this job re-transcribes the **full recording** with `elevenla
 through OpenRouter (10-minute mono MP3 pieces, word timestamps regrouped into sentences; seconds per
 meeting, ~$0.22/hour of audio) — chosen from a Hebrew bake-off of OpenRouter's transcription models
 (it held up best on noisy room audio; `microsoft/mai-transcribe-2` was a close second) — falling back to a local ivrit.ai
-Whisper model (faster-whisper, int8 CPU, ~1.5× the meeting length) if the API fails. It replaces
+Whisper model (faster-whisper, int8 CPU, ~1.5× the meeting length) if the API fails. Speakers are separated by voice (Scribe diarization, `FINAL_STT_DIARIZE`) and matched to Meet's
+participant names by timing: several people on one device become `<name> · voice N`. It replaces
 Vexa's live transcript with the final one (live copy backed up; the live pass is kept running only to
 name speakers — Vexa 0.12 records no separate speaker timeline), labels speakers from
 Vexa's live segments by time overlap, asks the host's `claude` CLI (Claude Code login) for a Hebrew
