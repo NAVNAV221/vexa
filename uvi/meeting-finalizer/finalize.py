@@ -30,6 +30,7 @@ Env:
   PROCESS_SINCE        ISO time; meetings that ended before it are skipped (default: first start)
   STATE_FILE           default ~/.local/state/uvi-meeting-finalizer.json
   POLL_S               default 60
+  TZ                   time zone of the date in the Slack post, e.g. Asia/Jerusalem (servers usually run UTC)
   VEXA_PG_CONTAINER    default vexa-v012-postgres-1   (final transcript replaces the live one)
   VEXA_REDIS_CONTAINER default vexa-v012-redis-1
   BACKUP_DIR           default ~/.local/state/uvi-meeting-finalizer-backups (live transcript kept here)
